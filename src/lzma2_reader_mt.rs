@@ -229,8 +229,12 @@ impl<R: Read> Lzma2ReaderMt<R> {
         let active_workers = self.active_workers.load(Ordering::Acquire);
         let queue_len = self.work_queue.len();
 
-        if queue_len > 0 && active_workers == spawned_workers && spawned_workers < self.max_workers
-        {
+        // Spawn another worker when more units are queued than there are idle
+        // workers to pick them up. `active_workers` is only raised by a worker
+        // *after* it stole a unit, so a parked worker that has not woken up yet
+        // still counts as idle here and is not doubled up needlessly.
+        let idle_workers = spawned_workers.saturating_sub(active_workers) as usize;
+        if queue_len > idle_workers && spawned_workers < self.max_workers {
             self.spawn_worker_thread();
         }
 
@@ -278,8 +282,12 @@ impl<R: Read> Lzma2ReaderMt<R> {
                         }
                     }
 
-                    // If the work queue has capacity, try to read more from the source.
-                    if self.work_queue.is_empty() {
+                    // Keep the workers fed: read ahead while fewer units are queued
+                    // than there are workers. Waiting for a result as soon as the
+                    // queue is non-empty races with the worker that is about to
+                    // steal that unit, and losing the race blocks the reader until
+                    // the unit is fully decoded while every other worker idles.
+                    if self.work_queue.len() < self.max_workers as usize {
                         match self.read_and_dispatch_chunk() {
                             Ok(true) => {
                                 // Successfully read and dispatched a chunk, loop to continue.

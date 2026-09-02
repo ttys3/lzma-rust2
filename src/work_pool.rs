@@ -222,8 +222,12 @@ where
                         }
                     }
 
-                    // If the work queue has capacity, try to read more from the source.
-                    if self.work_queue.len() < 2 {
+                    // Keep the workers fed: dispatch ahead while fewer items are
+                    // queued than there are workers. Blocking on a result as soon
+                    // as the queue holds an item races with the worker about to
+                    // steal it; losing that race stalls dispatch until the item is
+                    // fully processed while every other worker idles.
+                    if self.work_queue.len() < self.num_workers as usize {
                         match self.dispatch_next_work(&mut next_work_function) {
                             Ok(true) => {
                                 // Successfully read and dispatched a chunk, loop to continue.
@@ -360,11 +364,12 @@ where
         let queue_len = self.work_queue.len();
 
         // Spawn a new worker if:
-        // 1. There's work in the queue
-        // 2. All current workers are busy (active == spawned)
-        // 3. We haven't reached the maximum worker count
-        if queue_len > 0 && active_workers == spawned_workers && spawned_workers < self.num_workers
-        {
+        // 1. More work is queued than there are idle workers to pick it up
+        //    (`active_workers` is only raised after a worker stole its item, so a
+        //    parked worker that has not woken up yet still counts as idle)
+        // 2. We haven't reached the maximum worker count
+        let idle_workers = spawned_workers.saturating_sub(active_workers) as usize;
+        if queue_len > idle_workers && spawned_workers < self.num_workers {
             self.spawn_worker_thread();
         }
     }
