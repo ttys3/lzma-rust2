@@ -215,7 +215,7 @@ impl<R: Read> Lzma2Reader<R> {
     /// `inner` is the reader to read compressed data from.
     /// `dict_size` is the dictionary size in bytes.
     ///
-    /// With the `asm` feature on a supported arm64 target the chunks are
+    /// With the `asm` feature on a supported target (see [`LZMA2_ASM_DECODER`](crate::LZMA2_ASM_DECODER)) the chunks are
     /// decoded by 7-Zip's assembly decoder, except when a preset dictionary
     /// is given (the assembly has no support for one).
     pub fn new(inner: R, dict_size: u32, preset_dict: Option<&[u8]>) -> Self {
