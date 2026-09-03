@@ -13,10 +13,10 @@
 //!
 //! Deactivating the `optimization` feature will result in 100% standard Rust code.
 //!
-//! The opt-in `asm` feature (implies `optimization`) embeds 7-Zip's arm64 assembly LZMA decoder
-//! (public domain, vendored under `src/asm/`) and uses it for LZMA2 streams on little-endian
-//! arm64 targets with Mach-O or ELF object files; [`LZMA2_ASM_DECODER`] tells whether it is
-//! active. It is a no-op on every other target.
+//! The opt-in `asm` feature (implies `optimization`) embeds 7-Zip's assembly LZMA decoder
+//! (public domain, vendored under `src/asm/`) and uses it for LZMA2 streams on 64-bit arm64 and
+//! x86-64 targets with Mach-O or ELF object files (Apple, Linux, Android); [`LZMA2_ASM_DECODER`]
+//! tells whether it is active. It is a no-op on every other target.
 //!
 //! ## Performance
 //!
@@ -61,15 +61,20 @@
 extern crate alloc;
 
 /// Expands the first item group only when 7-Zip's assembly LZMA decoder can
-/// be used (`asm` feature, little-endian arm64, Mach-O or ELF), the second
-/// group otherwise. The two predicates must stay identical.
+/// be used (`asm` feature, little-endian 64-bit arm64 or x86-64, Mach-O or
+/// ELF), the second group otherwise. The two predicates must stay identical.
+///
+/// Windows is excluded because the x86-64 routine follows the System V
+/// calling convention; the arm64 one is AAPCS64 but only tested on Mach-O
+/// and ELF.
 macro_rules! cfg_lzma_asm {
     (if { $($yes:item)* } else { $($no:item)* }) => {
         $(
             #[cfg(all(
                 feature = "asm",
-                target_arch = "aarch64",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
                 target_endian = "little",
+                target_pointer_width = "64",
                 any(target_vendor = "apple", target_os = "linux", target_os = "android"),
                 not(miri)
             ))]
@@ -78,8 +83,9 @@ macro_rules! cfg_lzma_asm {
         $(
             #[cfg(not(all(
                 feature = "asm",
-                target_arch = "aarch64",
+                any(target_arch = "aarch64", target_arch = "x86_64"),
                 target_endian = "little",
+                target_pointer_width = "64",
                 any(target_vendor = "apple", target_os = "linux", target_os = "android"),
                 not(miri)
             )))]
@@ -91,13 +97,13 @@ macro_rules! cfg_lzma_asm {
 cfg_lzma_asm! {
     if {
         /// `true` when LZMA2 streams are decoded by 7-Zip's assembly decoder:
-        /// the `asm` feature is enabled and the target is a supported
-        /// little-endian arm64 platform (Apple, Linux or Android).
+        /// the `asm` feature is enabled and the target is a supported 64-bit
+        /// arm64 or x86-64 platform (Apple, Linux or Android).
         pub const LZMA2_ASM_DECODER: bool = true;
     } else {
         /// `true` when LZMA2 streams are decoded by 7-Zip's assembly decoder:
-        /// the `asm` feature is enabled and the target is a supported
-        /// little-endian arm64 platform (Apple, Linux or Android).
+        /// the `asm` feature is enabled and the target is a supported 64-bit
+        /// arm64 or x86-64 platform (Apple, Linux or Android).
         pub const LZMA2_ASM_DECODER: bool = false;
     }
 }

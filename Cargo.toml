@@ -15,7 +15,7 @@ exclude = ["/tests/data"]
 default = ["std", "encoder", "optimization", "lzip", "xz"]
 std = []
 optimization = []
-# 7-Zip's arm64 assembly LZMA decoder for LZMA2 (see src/asm/README.md); a no-op on other targets.
+# 7-Zip's arm64 / x86-64 assembly LZMA decoder for LZMA2 (see src/asm/README.md); a no-op on other targets.
 asm = ["optimization"]
 encoder = []
 xz = ["sha2"]
