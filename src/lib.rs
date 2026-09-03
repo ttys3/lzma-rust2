@@ -13,6 +13,11 @@
 //!
 //! Deactivating the `optimization` feature will result in 100% standard Rust code.
 //!
+//! The opt-in `asm` feature (implies `optimization`) embeds 7-Zip's arm64 assembly LZMA decoder
+//! (public domain, vendored under `src/asm/`) and uses it for LZMA2 streams on little-endian
+//! arm64 targets with Mach-O or ELF object files; [`LZMA2_ASM_DECODER`] tells whether it is
+//! active. It is a no-op on every other target.
+//!
 //! ## Performance
 //!
 //! When compared against the `liblzma` crate, which uses the C library of the same name, this crate

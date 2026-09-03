@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `asm` feature: 7-Zip's hand-written arm64 assembly LZMA decoder (public domain, vendored under `src/asm/` with a
+  regeneration script) decodes LZMA2 in `Lzma2Reader`, `Lzma2ReaderMt` and the LZMA2 filter of `XzReader` on
+  little-endian arm64 targets with Mach-O or ELF object files. Single-threaded LZMA2 decoding then matches `7zz`
+  (0.59 s vs 0.88 s for the portable decoder on a 128 MiB stream, Apple M4 Pro). The feature is a no-op elsewhere;
+  `LZMA2_ASM_DECODER` tells whether it is active. Streams with a preset dictionary keep the portable decoder.
+
 ### Fixed
 
 - `Lzma2ReaderMt`, `XzReaderMt` and `LzipReaderMt` no longer degrade to single-threaded decoding. The reader blocked
