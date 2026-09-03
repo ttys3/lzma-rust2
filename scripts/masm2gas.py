@@ -95,6 +95,11 @@ def gas_number(s):
     return s
 
 
+def rust_asm_comment(s):
+    """Escape template braces in comments included by global_asm!."""
+    return s.replace("{", "{{").replace("}", "}}")
+
+
 def split_args(argstr):
     """Split a macro argument list at top-level commas (`(a, b)` allowed)."""
     argstr = argstr.strip()
@@ -425,7 +430,7 @@ class Translator:
                 continue
             if not toks:
                 if comment and not in_macro:
-                    self.emit("#" + comment)
+                    self.emit("#" + rust_asm_comment(comment))
                 elif not in_macro:
                     self.emit("")
                 continue
@@ -497,7 +502,7 @@ class Translator:
             # Instructions.
             text = "        " + self.translate_instruction(tokenize(code.strip()))
             if comment and not in_macro:
-                text += " #" + comment
+                text += " #" + rust_asm_comment(comment)
             self.emit(text)
 
     # ---- output ----

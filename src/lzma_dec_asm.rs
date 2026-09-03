@@ -13,29 +13,23 @@
 
 cfg_lzma_asm! {
     if {
-        #[cfg(target_vendor = "apple")]
-        macro_rules! sym_prefix {
-            () => {
-                "_"
-            };
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        macro_rules! sym_prefix {
-            () => {
-                ""
-            };
-        }
+        // `sym` renders this private Rust item's fully mangled name, including
+        // rustc's crate disambiguator and the platform's symbol prefix. The
+        // assembly entry derives its name from it, so every Cargo crate instance
+        // gets a distinct external symbol even when name and version are equal.
+        fn decode_real_symbol_prefix() {}
 
-        /// The exported symbol carries the crate version: two semver-incompatible
-        /// copies of lzma-rust2 can end up in one binary, and both may enable `asm`.
+        /// The exported symbol carries both the full package version and the
+        /// compiler-generated crate disambiguator.
         macro_rules! decode_real_sym {
             () => {
                 concat!(
-                    sym_prefix!(),
-                    "lzma_rust2_",
+                    "{decode_real_symbol_prefix}_v",
                     env!("CARGO_PKG_VERSION_MAJOR"),
                     "_",
                     env!("CARGO_PKG_VERSION_MINOR"),
+                    "_",
+                    env!("CARGO_PKG_VERSION_PATCH"),
                     "_lzma_dec_decode_real_3"
                 )
             };

@@ -17,7 +17,7 @@ global_asm!(
     // BTI landing pad; a NOP on cores without branch target identification.
     "hint #34",
     include_str!("../asm/lzma_dec_opt_arm64.s"),
-    options(raw),
+    decode_real_symbol_prefix = sym super::decode_real_symbol_prefix,
 );
 
 /// Calls 7-Zip's `LzmaDec_DecodeReal_3`.
@@ -41,6 +41,7 @@ pub(crate) unsafe fn decode_real(p: *mut CLzmaDec, limit: usize, buf_limit: *con
             inout("x0") p as u64 => ret,
             in("x1") limit,
             in("x2") buf_limit,
+            decode_real_symbol_prefix = sym super::decode_real_symbol_prefix,
             clobber_abi("C"),
         );
     }
