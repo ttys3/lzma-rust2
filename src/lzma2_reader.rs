@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use super::{
     Read,
@@ -10,6 +10,7 @@ use super::{
 use crate::{
     ByteReader, DICT_SIZE_MIN,
     filter::{FilterConfig, StreamFilter},
+    lzma_dec_asm::AsmCore,
     lzma_reader::{InputEnd, Limits, LzmaCore, RC_INIT_SIZE},
     stream::{Action, Status, StreamResult},
 };
@@ -37,14 +38,119 @@ const DRAIN_SIZE_MAX: usize = 4096;
 /// ```
 pub struct Lzma2Reader<R> {
     inner: R,
-    lz: LzDecoder,
-    rc: RangeDecoder<RangeDecoderBuffer>,
-    lzma: Option<LzmaDecoder>,
+    core: Lzma2Core,
     uncompressed_size: usize,
     is_lzma_chunk: bool,
     need_dict_reset: bool,
     need_props: bool,
     end_reached: bool,
+}
+
+/// The decoder behind a [`Lzma2Reader`]: the portable one, or 7-Zip's
+/// assembly decoder when the `asm` feature is usable on this target.
+enum Lzma2Core {
+    Portable(Box<PortableCore>),
+    Asm(Box<AsmCore>),
+}
+
+/// State of the portable decoder: window, range decoder buffer and the
+/// probability model of the current properties.
+struct PortableCore {
+    lz: LzDecoder,
+    rc: RangeDecoder<RangeDecoderBuffer>,
+    lzma: Option<LzmaDecoder>,
+}
+
+impl Lzma2Core {
+    fn portable(dic_buf_size: usize, preset_dict: Option<&[u8]>) -> Self {
+        Self::Portable(Box::new(PortableCore {
+            lz: LzDecoder::new(dic_buf_size, preset_dict),
+            rc: RangeDecoder::new_buffer(COMPRESSED_SIZE_MAX as _),
+            lzma: None,
+        }))
+    }
+
+    fn ensure_capacity(&mut self) -> crate::Result<()> {
+        match self {
+            Self::Portable(core) => core.lz.ensure_capacity(),
+            Self::Asm(core) => core.ensure_capacity(),
+        }
+    }
+
+    fn reset_dict(&mut self) {
+        match self {
+            Self::Portable(core) => core.lz.reset(),
+            Self::Asm(core) => core.reset_dict(),
+        }
+    }
+
+    fn set_props(&mut self, lc: u8, lp: u8, pb: u8) -> crate::Result<()> {
+        match self {
+            Self::Portable(core) => {
+                core.lzma = Some(LzmaDecoder::new(lc as _, lp as _, pb as _));
+                Ok(())
+            }
+            Self::Asm(core) => core.set_props(lc, lp, pb),
+        }
+    }
+
+    fn reset_state(&mut self) {
+        match self {
+            Self::Portable(core) => {
+                if let Some(l) = core.lzma.as_mut() {
+                    l.reset()
+                }
+            }
+            Self::Asm(core) => core.reset_state(),
+        }
+    }
+
+    fn load_chunk<R: Read>(&mut self, inner: &mut R, compressed_size: usize) -> crate::Result<()> {
+        match self {
+            Self::Portable(core) => core.rc.prepare(inner, compressed_size),
+            Self::Asm(core) => core.load_chunk(inner, compressed_size),
+        }
+    }
+
+    /// Decodes up to `out.len()` bytes of the current chunk; fewer come back
+    /// when the dictionary window ends first.
+    fn decode(&mut self, out: &mut [u8]) -> crate::Result<usize> {
+        match self {
+            Self::Portable(core) => {
+                let PortableCore { lz, rc, lzma } = &mut **core;
+                let lzma = lzma
+                    .as_mut()
+                    .ok_or_else(|| error_invalid_input("corrupted input data (LZMA2:1)"))?;
+                lz.set_limit(out.len());
+                lzma.decode(lz, rc)?;
+                lz.flush(out, 0)
+            }
+            Self::Asm(core) => core.decode(out),
+        }
+    }
+
+    fn copy_uncompressed<R: Read>(
+        &mut self,
+        inner: &mut R,
+        out: &mut [u8],
+    ) -> crate::Result<usize> {
+        match self {
+            Self::Portable(core) => {
+                core.lz.copy_uncompressed(inner, out.len())?;
+                core.lz.flush(out, 0)
+            }
+            Self::Asm(core) => core.copy_uncompressed(inner, out),
+        }
+    }
+
+    /// Whether the chunk ended cleanly: every compressed byte consumed, the
+    /// range coder on zero, no match pending.
+    fn chunk_finished(&self) -> bool {
+        match self {
+            Self::Portable(core) => core.rc.is_finished() && !core.lz.has_pending(),
+            Self::Asm(core) => core.chunk_finished(),
+        }
+    }
 }
 
 /// Calculates the memory usage in KiB required for LZMA2 decompression.
@@ -72,7 +178,8 @@ fn get_dict_size(dict_size: u32) -> u32 {
     (dict_size + 15) & !15
 }
 
-fn decode_lzma2_props(props: u8) -> crate::Result<LzmaDecoder> {
+/// Splits an LZMA2 properties byte into `(lc, lp, pb)`.
+fn decode_lzma2_props(props: u8) -> crate::Result<(u8, u8, u8)> {
     if props > (4 * 5 + 4) * 9 + 8 {
         return Err(error_invalid_input("corrupted input data (LZMA2:3)"));
     }
@@ -83,7 +190,7 @@ fn decode_lzma2_props(props: u8) -> crate::Result<LzmaDecoder> {
     if lc + lp > 4 {
         return Err(error_invalid_input("corrupted input data (LZMA2:4)"));
     }
-    Ok(LzmaDecoder::new(lc as _, lp as _, pb as _))
+    Ok((lc, lp, pb))
 }
 
 impl<R> Lzma2Reader<R> {
@@ -107,15 +214,44 @@ impl<R: Read> Lzma2Reader<R> {
     /// Create a new LZMA2 reader.
     /// `inner` is the reader to read compressed data from.
     /// `dict_size` is the dictionary size in bytes.
+    ///
+    /// With the `asm` feature on a supported target (see [`LZMA2_ASM_DECODER`](crate::LZMA2_ASM_DECODER)) the chunks are
+    /// decoded by 7-Zip's assembly decoder, except when a preset dictionary
+    /// is given (the assembly has no support for one).
     pub fn new(inner: R, dict_size: u32, preset_dict: Option<&[u8]>) -> Self {
         let has_preset = preset_dict.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
-        let lz = LzDecoder::new(get_dict_size(dict_size) as _, preset_dict);
-        let rc = RangeDecoder::new_buffer(COMPRESSED_SIZE_MAX as _);
+        let dic_buf_size = get_dict_size(dict_size) as usize;
+        let asm = if has_preset {
+            None
+        } else {
+            AsmCore::new(dic_buf_size)
+        };
+        let core = match asm {
+            Some(asm) => Lzma2Core::Asm(Box::new(asm)),
+            None => Lzma2Core::portable(dic_buf_size, preset_dict),
+        };
+        Self::with_core(inner, core, has_preset)
+    }
+
+    /// Like [`Lzma2Reader::new`], but always uses the portable decoder even
+    /// when the assembly one is available. Meant for differential testing.
+    #[doc(hidden)]
+    pub fn new_portable(inner: R, dict_size: u32, preset_dict: Option<&[u8]>) -> Self {
+        let has_preset = preset_dict.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+        let core = Lzma2Core::portable(get_dict_size(dict_size) as usize, preset_dict);
+        Self::with_core(inner, core, has_preset)
+    }
+
+    /// Whether this reader decodes through 7-Zip's assembly decoder.
+    #[doc(hidden)]
+    pub fn is_asm_core(&self) -> bool {
+        matches!(self.core, Lzma2Core::Asm(_))
+    }
+
+    fn with_core(inner: R, core: Lzma2Core, has_preset: bool) -> Self {
         Self {
             inner,
-            lz,
-            rc,
-            lzma: None,
+            core,
             uncompressed_size: 0,
             is_lzma_chunk: false,
             need_dict_reset: !has_preset,
@@ -153,8 +289,7 @@ impl<R: Read> Lzma2Reader<R> {
         if control >= 0xE0 || control == 0x01 {
             self.need_props = true;
             self.need_dict_reset = false;
-            // Reset dictionary
-            self.lz.reset();
+            self.core.reset_dict();
         } else if self.need_dict_reset {
             return Err(error_invalid_input("corrupted input data (LZMA2:0)"));
         }
@@ -171,13 +306,10 @@ impl<R: Read> Lzma2Reader<R> {
             } else if self.need_props {
                 return Err(error_invalid_input("corrupted input data (LZMA2:1)"));
             } else if control >= 0xA0 {
-                // Reset state
-                if let Some(l) = self.lzma.as_mut() {
-                    l.reset()
-                }
+                self.core.reset_state();
             }
 
-            self.rc.prepare(&mut self.inner, compressed_size)?;
+            self.core.load_chunk(&mut self.inner, compressed_size)?;
         } else if control > 0x02 {
             return Err(error_invalid_input("corrupted input data (LZMA2:2)"));
         } else {
@@ -189,8 +321,8 @@ impl<R: Read> Lzma2Reader<R> {
 
     fn decode_props(&mut self) -> crate::Result<()> {
         let props = self.inner.read_u8()?;
-        self.lzma = Some(decode_lzma2_props(props)?);
-        Ok(())
+        let (lc, lp, pb) = decode_lzma2_props(props)?;
+        self.core.set_props(lc, lp, pb)
     }
 }
 
@@ -204,7 +336,7 @@ impl<R: Read> Read for Lzma2Reader<R> {
             return Ok(0);
         }
 
-        self.lz.ensure_capacity()?;
+        self.core.ensure_capacity()?;
 
         let mut size = 0;
         let mut len = buf.len();
@@ -217,26 +349,22 @@ impl<R: Read> Read for Lzma2Reader<R> {
                 }
             }
 
+            // Never past the chunk's declared size, so a decoder cannot run
+            // into the next chunk's bytes.
             let copy_size_max = self.uncompressed_size.min(len);
-            if !self.is_lzma_chunk {
-                self.lz.copy_uncompressed(&mut self.inner, copy_size_max)?;
+            let out = &mut buf[off..off + copy_size_max];
+            let copied_size = if self.is_lzma_chunk {
+                self.core.decode(out)?
             } else {
-                self.lz.set_limit(copy_size_max);
-                if let Some(lzma) = self.lzma.as_mut() {
-                    lzma.decode(&mut self.lz, &mut self.rc)?;
-                }
-            }
+                self.core.copy_uncompressed(&mut self.inner, out)?
+            };
 
-            {
-                let copied_size = self.lz.flush(buf, off)?;
-                off = off.saturating_add(copied_size);
-                len = len.saturating_sub(copied_size);
-                size = size.saturating_add(copied_size);
-                self.uncompressed_size = self.uncompressed_size.saturating_sub(copied_size);
-                if self.uncompressed_size == 0 && (!self.rc.is_finished() || self.lz.has_pending())
-                {
-                    return Err(error_invalid_input("rc not finished or lz has pending"));
-                }
+            off = off.saturating_add(copied_size);
+            len = len.saturating_sub(copied_size);
+            size = size.saturating_add(copied_size);
+            self.uncompressed_size = self.uncompressed_size.saturating_sub(copied_size);
+            if self.uncompressed_size == 0 && self.is_lzma_chunk && !self.core.chunk_finished() {
+                return Err(error_invalid_input("rc not finished or lz has pending"));
             }
         }
 
@@ -856,7 +984,8 @@ impl Lzma2Stream {
 
         if control >= 0xC0 {
             self.need_props = false;
-            self.lzma = Some(decode_lzma2_props(self.accum[5])?);
+            let (lc, lp, pb) = decode_lzma2_props(self.accum[5])?;
+            self.lzma = Some(LzmaDecoder::new(lc as _, lp as _, pb as _));
         } else if self.need_props {
             return Err(error_invalid_input("corrupted input data (LZMA2:1)"));
         } else if control >= 0xA0 {
