@@ -179,9 +179,10 @@ impl<R: Read> Lzma2ReaderMt<R> {
             self.inner.read_exact(&mut header_buf[..header_len])?;
             self.current_work_unit
                 .extend_from_slice(&header_buf[..header_len]);
-            self.current_unit_unpacked += (((control & 0x1F) as usize) << 16)
+            let unpacked_size = (((control & 0x1F) as usize) << 16)
                 + u16::from_be_bytes([header_buf[0], header_buf[1]]) as usize
                 + 1;
+            self.add_unpacked_size(unpacked_size)?;
             u16::from_be_bytes([header_buf[2], header_buf[3]]) as usize + 1
         } else if control == 0x01 || control == 0x02 {
             // Uncompressed chunk.
@@ -189,7 +190,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             self.inner.read_exact(&mut size_buf)?;
             self.current_work_unit.extend_from_slice(&size_buf);
             let size = u16::from_be_bytes(size_buf) as usize + 1;
-            self.current_unit_unpacked += size;
+            self.add_unpacked_size(size)?;
             size
         } else {
             return Err(io::Error::new(
@@ -208,6 +209,17 @@ impl<R: Read> Lzma2ReaderMt<R> {
         }
 
         Ok(true)
+    }
+
+    fn add_unpacked_size(&mut self, size: usize) -> io::Result<()> {
+        let Some(total) = self.current_unit_unpacked.checked_add(size) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LZMA2 work unit unpacked size exceeds the platform limit",
+            ));
+        };
+        self.current_unit_unpacked = total;
+        Ok(())
     }
 
     /// Sends the current work unit to the workers.
@@ -480,5 +492,29 @@ impl<R: Read> Drop for Lzma2ReaderMt<R> {
         self.work_queue.close();
         // Worker threads will exit when the work queue is closed.
         // JoinHandles will be dropped, which is fine since we set the shutdown flag,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_compressed_work_unit_unpacked_size_overflow() {
+        // A dependent compressed chunk that declares 2 MiB unpacked and one
+        // byte packed. Preloading the accumulator reaches the same boundary as
+        // 2,048 such headers do on a 32-bit target, without a target-specific
+        // multi-gigabyte allocation.
+        let input = [0x9F, 0xFF, 0xFF, 0x00, 0x00, 0x00];
+        let mut reader = Lzma2ReaderMt::new(input.as_slice(), 4096, None, 1);
+        reader.current_unit_unpacked = usize::MAX - 2 * 1024 * 1024 + 1;
+
+        let error = reader.read_and_dispatch_chunk().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "LZMA2 work unit unpacked size exceeds the platform limit"
+        );
     }
 }

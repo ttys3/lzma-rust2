@@ -52,10 +52,10 @@ plus a soak: `LZMA2_DIFF_SOAK_SECS=3600 cargo test --release --features asm
 3. `#pragma`, the `.text` / `.align` / `.p2align` header, `.globl` and the two
    entry labels (`LzmaDec_DecodeReal_3` / `_LzmaDec_DecodeReal_3`) are dropped.
    `src/lzma_dec_asm/arm64.rs` emits the section header and an entry label whose
-   name carries the crate version
-   (`lzma_rust2_<major>_<minor>_lzma_dec_decode_real_3`, with the Mach-O
-   underscore prefix where needed), so two lzma-rust2 versions linked into one
-   binary cannot clash.
+   name is derived from a private Rust symbol. Its mangled name carries rustc's
+   crate disambiguator (and the platform's symbol prefix), while the suffix
+   records the full package version. This keeps the entry distinct even when a
+   binary links same-version copies from different Cargo sources.
 4. Every internal label and every `.equ` constant is renamed to an
    assembler-local `L*` name. rustc emits `.subsections_via_symbols` for Mach-O,
    and in that mode the assembler rejects a conditional branch to a non-local
@@ -94,7 +94,8 @@ pass-through:
 - `MY_PROC` / `MY_ENDP`, `SEGMENT`, `OPTION`, `PROC` / `ENDP` are dropped.
   `src/lzma_dec_asm/x86_64.rs` emits the section header, a 64-byte aligned
   entry (upstream places the routine in a 64-byte aligned segment) with an
-  `endbr64` landing pad, and the versioned symbol; `MY_ENDP` becomes `ret`.
+  `endbr64` landing pad, and the crate-disambiguated, fully versioned symbol;
+  `MY_ENDP` becomes `ret`.
 - `align N` → `.p2align log2(N)`; `SHORT` / `near ptr` are dropped (the
   assembler picks the encoding); `123h` → `0x123`; mnemonics and registers are
   lowercased.

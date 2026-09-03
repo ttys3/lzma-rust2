@@ -1158,10 +1158,10 @@ Lcopy_match:
 # add     sym, kMatchMinLen
 
 # if ((rem = limit - dicPos) == 0)
-# {
+# {{
 #   p->dicPos = dicPos;
 #   return SZ_ERROR_DATA;
-# }
+# }}
         mov     rdx, qword ptr [rsp + LCLzmaDec_Asm_Loc_limit]
         sub     rdx, r14
         jz      Lfin_dicPos_LIMIT
