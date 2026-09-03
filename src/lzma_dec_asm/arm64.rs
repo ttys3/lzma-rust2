@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(dec.buf, data_end, "all compressed bytes consumed");
         assert_eq!(dec.code, 0, "range coder finished");
         assert_eq!(dec.remain_len, 0);
-        assert!(&dic[..unpacked] == &text[..], "decoded bytes differ");
+        assert!(dic[..unpacked] == text[..], "decoded bytes differ");
     }
 
     #[test]
