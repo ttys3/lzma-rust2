@@ -245,12 +245,14 @@ impl<R: Read + Seek> XzReaderMt<R> {
             ));
         }
 
+        // Spawn another worker when more blocks are queued than there are idle
+        // workers to pick them up. `active_workers` is only raised by a worker
+        // *after* it stole a block, so a parked worker that has not woken up yet
+        // still counts as idle here and is not doubled up needlessly.
         let spawned_workers = self.worker_handles.len() as u32;
         let active_workers = self.active_workers.load(Ordering::Acquire);
         let queue_len = self.work_queue.len();
 
-        // Spawn another worker when more blocks are queued than there are idle ones. A parked
-        // worker that has not stolen its block yet still counts as idle.
         let idle_workers = spawned_workers.saturating_sub(active_workers) as usize;
         if queue_len > idle_workers && spawned_workers < self.max_workers {
             self.spawn_worker_thread();
@@ -301,8 +303,11 @@ impl<R: Read + Seek> XzReaderMt<R> {
                         }
                     }
 
-                    // Read ahead while fewer blocks are queued than there are workers. Blocking as
-                    // soon as the queue is non-empty stalls the reader behind a single worker.
+                    // Keep the workers fed: read ahead while fewer blocks are queued
+                    // than there are workers. Waiting for a result as soon as the
+                    // queue is non-empty races with the worker that is about to
+                    // steal that block, and losing the race blocks the reader until
+                    // the block is fully decoded while every other worker idles.
                     if self.work_queue.len() < self.max_workers as usize {
                         match self.dispatch_next_block() {
                             Ok(true) => {

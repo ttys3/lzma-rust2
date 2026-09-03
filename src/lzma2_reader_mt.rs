@@ -20,8 +20,9 @@ use crate::{
 };
 
 /// A work unit for a worker thread.
-/// Contains the sequence number and the raw compressed bytes for a series of chunks.
-type WorkUnit = (u64, Vec<u8>);
+/// Contains the sequence number, the raw compressed bytes for a series of
+/// chunks, and their total decompressed size (from the chunk headers).
+type WorkUnit = (u64, Vec<u8>, usize);
 
 /// A result unit from a worker thread.
 /// Contains the sequence number and the decompressed data.
@@ -45,6 +46,8 @@ pub struct Lzma2ReaderMt<R: Read> {
     result_rx: Receiver<ResultUnit>,
     result_tx: SyncSender<ResultUnit>,
     current_work_unit: Vec<u8>,
+    /// Decompressed size of the chunks gathered in `current_work_unit`.
+    current_unit_unpacked: usize,
     next_sequence_to_dispatch: u64,
     next_sequence_to_return: u64,
     last_sequence_id: Option<u64>,
@@ -83,6 +86,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             result_rx,
             result_tx,
             current_work_unit: Vec::with_capacity(1024 * 1024),
+            current_unit_unpacked: 0,
             next_sequence_to_dispatch: 0,
             next_sequence_to_return: 0,
             last_sequence_id: None,
@@ -175,13 +179,18 @@ impl<R: Read> Lzma2ReaderMt<R> {
             self.inner.read_exact(&mut header_buf[..header_len])?;
             self.current_work_unit
                 .extend_from_slice(&header_buf[..header_len]);
+            self.current_unit_unpacked += (((control & 0x1F) as usize) << 16)
+                + u16::from_be_bytes([header_buf[0], header_buf[1]]) as usize
+                + 1;
             u16::from_be_bytes([header_buf[2], header_buf[3]]) as usize + 1
         } else if control == 0x01 || control == 0x02 {
             // Uncompressed chunk.
             let mut size_buf = [0u8; 2];
             self.inner.read_exact(&mut size_buf)?;
             self.current_work_unit.extend_from_slice(&size_buf);
-            u16::from_be_bytes(size_buf) as usize + 1
+            let size = u16::from_be_bytes(size_buf) as usize + 1;
+            self.current_unit_unpacked += size;
+            size
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -209,10 +218,11 @@ impl<R: Read> Lzma2ReaderMt<R> {
 
         let work_unit =
             core::mem::replace(&mut self.current_work_unit, Vec::with_capacity(1024 * 1024));
+        let unpacked = core::mem::take(&mut self.current_unit_unpacked);
 
         if !self
             .work_queue
-            .push((self.next_sequence_to_dispatch, work_unit))
+            .push((self.next_sequence_to_dispatch, work_unit, unpacked))
         {
             // Queue is closed, this indicates shutdown.
             self.state = State::Error;
@@ -223,12 +233,16 @@ impl<R: Read> Lzma2ReaderMt<R> {
             );
         }
 
+        // We spawn a new thread if we have work queued, no available workers, and haven't reached
+        // the maximal allowed parallelism yet.
         let spawned_workers = self.worker_handles.len() as u32;
         let active_workers = self.active_workers.load(Ordering::Acquire);
         let queue_len = self.work_queue.len();
 
-        // Spawn another worker when more units are queued than there are idle ones. A parked
-        // worker that has not stolen its unit yet still counts as idle.
+        // Spawn another worker when more units are queued than there are idle
+        // workers to pick them up. `active_workers` is only raised by a worker
+        // *after* it stole a unit, so a parked worker that has not woken up yet
+        // still counts as idle here and is not doubled up needlessly.
         let idle_workers = spawned_workers.saturating_sub(active_workers) as usize;
         if queue_len > idle_workers && spawned_workers < self.max_workers {
             self.spawn_worker_thread();
@@ -278,8 +292,11 @@ impl<R: Read> Lzma2ReaderMt<R> {
                         }
                     }
 
-                    // Read ahead while fewer units are queued than there are workers. Blocking as
-                    // soon as the queue is non-empty stalls the reader behind a single worker.
+                    // Keep the workers fed: read ahead while fewer units are queued
+                    // than there are workers. Waiting for a result as soon as the
+                    // queue is non-empty races with the worker that is about to
+                    // steal that unit, and losing the race blocks the reader until
+                    // the unit is fully decoded while every other worker idles.
                     if self.work_queue.len() < self.max_workers as usize {
                         match self.read_and_dispatch_chunk() {
                             Ok(true) => {
@@ -389,7 +406,7 @@ fn worker_thread_logic(
     active_workers: Arc<AtomicU32>,
 ) {
     while !shutdown_flag.load(Ordering::Acquire) {
-        let (seq, work_unit_data) = match worker_handle.steal() {
+        let (seq, work_unit_data, unpacked) = match worker_handle.steal() {
             Some(work) => {
                 active_workers.fetch_add(1, Ordering::Release);
                 work
@@ -406,7 +423,13 @@ fn worker_thread_logic(
             preset_dict.as_deref().map(|v| v.as_slice()),
         );
 
-        let mut decompressed_data = Vec::with_capacity(work_unit_data.len());
+        // The chunk headers say how much comes out, so the result buffer can be
+        // sized once instead of growing (and copying) its way there. A header
+        // claiming more than can be reserved falls back to growth.
+        let mut decompressed_data = Vec::new();
+        if decompressed_data.try_reserve_exact(unpacked).is_err() {
+            decompressed_data = Vec::with_capacity(work_unit_data.len());
+        }
         let result = match reader.read_to_end(&mut decompressed_data) {
             Ok(_) => decompressed_data,
             Err(error) => {

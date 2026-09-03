@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `asm` feature: 7-Zip's hand-written assembly LZMA decoder (public domain, vendored under `src/asm/` with
+  regeneration scripts) decodes LZMA2 in `Lzma2Reader`, `Lzma2ReaderMt` and the LZMA2 filter of `XzReader` on 64-bit
+  arm64 and x86-64 targets with Mach-O or ELF object files (Apple, Linux, Android). The arm64 routine is embedded as
+  is; the x86-64 one is 7-Zip's MASM source translated to GNU syntax by `scripts/masm2gas.py` for the System V ABI.
+  Single-threaded LZMA2 decoding then matches `7zz`: on arm64 0.59 s vs 0.88 s for the portable decoder on a 128 MiB
+  stream (Apple M4 Pro); on x86-64 the portable decoder is already fast, so the gain is 1.1-1.25x on text and
+  executables (Intel i7-14700KF) and very repetitive input can decode slightly slower. The feature is a no-op
+  elsewhere, Windows included; `LZMA2_ASM_DECODER` tells whether it is active. Streams with a preset dictionary keep
+  the portable decoder.
+
 ### Fixed
 
 - `Lzma2ReaderMt` and `XzReaderMt` no longer degrade to single-threaded decoding.
