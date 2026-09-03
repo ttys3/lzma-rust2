@@ -55,11 +55,54 @@
 
 extern crate alloc;
 
+/// Expands the first item group only when 7-Zip's assembly LZMA decoder can
+/// be used (`asm` feature, little-endian arm64, Mach-O or ELF), the second
+/// group otherwise. The two predicates must stay identical.
+macro_rules! cfg_lzma_asm {
+    (if { $($yes:item)* } else { $($no:item)* }) => {
+        $(
+            #[cfg(all(
+                feature = "asm",
+                target_arch = "aarch64",
+                target_endian = "little",
+                any(target_vendor = "apple", target_os = "linux", target_os = "android"),
+                not(miri)
+            ))]
+            $yes
+        )*
+        $(
+            #[cfg(not(all(
+                feature = "asm",
+                target_arch = "aarch64",
+                target_endian = "little",
+                any(target_vendor = "apple", target_os = "linux", target_os = "android"),
+                not(miri)
+            )))]
+            $no
+        )*
+    };
+}
+
+cfg_lzma_asm! {
+    if {
+        /// `true` when LZMA2 streams are decoded by 7-Zip's assembly decoder:
+        /// the `asm` feature is enabled and the target is a supported
+        /// little-endian arm64 platform (Apple, Linux or Android).
+        pub const LZMA2_ASM_DECODER: bool = true;
+    } else {
+        /// `true` when LZMA2 streams are decoded by 7-Zip's assembly decoder:
+        /// the `asm` feature is enabled and the target is a supported
+        /// little-endian arm64 platform (Apple, Linux or Android).
+        pub const LZMA2_ASM_DECODER: bool = false;
+    }
+}
+
 mod decoder;
 mod lz;
 #[cfg(feature = "lzip")]
 mod lzip;
 mod lzma2_reader;
+mod lzma_dec_asm;
 mod lzma_reader;
 mod range_dec;
 mod state;
