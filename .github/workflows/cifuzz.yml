@@ -20,6 +20,7 @@ jobs:
           - lzma
           - lzma_stream
           - lzma2
+          - lzma2_diff
           - lzma2_stream
           - xz
           - xz_stream

@@ -52,8 +52,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --release --all-features
       - name: Check the generated assembly is up to date
-        if: matrix.os == 'macos-latest'
-        run: scripts/gen-lzma-dec-asm.sh && git diff --exit-code src/asm
+        if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
+        run: scripts/gen-lzma-dec-asm.sh && scripts/gen-lzma-dec-asm-x86_64.sh && git diff --exit-code src/asm
 
   build-wasm:
     runs-on: ${{matrix.os}}
