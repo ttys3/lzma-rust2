@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-lzma-rust2 = { path = "..", features = [ "lzip", "xz" ] }
+lzma-rust2 = { path = "..", features = [ "lzip", "xz", "asm" ] }
 
 [[bin]]
 name = "lzip"
@@ -74,5 +74,11 @@ doc = false
 [[bin]]
 name = "xz_uncompressed_size"
 path = "fuzz_targets/xz_uncompressed_size.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lzma2_diff"
+path = "fuzz_targets/lzma2_diff.rs"
 test = false
 doc = false

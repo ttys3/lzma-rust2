@@ -468,8 +468,11 @@ where
         let active_workers = self.active_workers.load(Ordering::Acquire);
         let queue_len = self.work_queue.len();
 
-        // Spawn another worker when more items are queued than there are idle ones. A parked
-        // worker that has not stolen its item yet still counts as idle.
+        // Spawn a new worker if:
+        // 1. More work is queued than there are idle workers to pick it up
+        //    (`active_workers` is only raised after a worker stole its item, so a
+        //    parked worker that has not woken up yet still counts as idle)
+        // 2. We haven't reached the maximum worker count
         let idle_workers = spawned_workers.saturating_sub(active_workers) as usize;
         if queue_len > idle_workers && spawned_workers < self.num_workers {
             self.spawn_worker_thread();
