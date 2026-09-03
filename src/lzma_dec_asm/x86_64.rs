@@ -25,7 +25,7 @@ global_asm!(
     // IBT landing pad; a NOP on cores without CET.
     "endbr64",
     include_str!("../asm/lzma_dec_opt_x86_64.s"),
-    options(raw),
+    decode_real_symbol_prefix = sym super::DECODE_REAL_SYMBOL_PREFIX,
 );
 
 /// Calls 7-Zip's `LzmaDec_DecodeReal_3`.
@@ -52,6 +52,7 @@ pub(crate) unsafe fn decode_real(p: *mut CLzmaDec, limit: usize, buf_limit: *con
             in("rsi") limit,
             in("rdx") buf_limit,
             out("eax") ret,
+            decode_real_symbol_prefix = sym super::DECODE_REAL_SYMBOL_PREFIX,
             clobber_abi("sysv64"),
         );
     }
