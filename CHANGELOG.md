@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.21.0 - 2026-09-18
+
 ### Added
 
 - Add `LzmaReader::into_parts` to recover buffered input together with the inner reader.
@@ -42,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the inner writer.
 - Reduce stack usage of `XzWriter` by boxing `FilterWriter` enum variants.
 - Allow the user to drive `LzmaStream` using only `Action::Run`.
+- Bound XzReaderMt block decoding by the uncompressed size recorded in the index, and reject size mismatches to prevent
+  excessive memory usage from malformed blocks.
 
 ## 0.20.1 - 2026-08-30
 
