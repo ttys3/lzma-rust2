@@ -8,6 +8,9 @@ feature is enabled on a supported target and drive LZMA2 decoding in
 `XzReader`). See `src/lzma_dec_asm/common.rs` for the calling contract and the
 Rust wrapper, `src/lzma_dec_asm/arm64.rs` / `x86_64.rs` for the entry points.
 
+The two architectures go through different generation scripts. This file
+covers what each one does; `TOOLCHAIN.md` covers why they differ.
+
 ## Provenance and licence
 
 - `upstream/LzmaDecOpt.S` and `upstream/7zAsm.S` are verbatim copies from the
