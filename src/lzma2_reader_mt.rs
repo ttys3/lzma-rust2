@@ -71,6 +71,11 @@ impl<R: Read> Lzma2ReaderMt<R> {
     /// - `dict_size`: The dictionary size in bytes, as specified in the stream properties.
     /// - `preset_dict`: An optional preset dictionary.
     /// - `num_workers`: The maximum number of worker threads for decompression. Currently capped at 256 Threads.
+    ///
+    /// At most `num_workers + 1` work units are in flight at once: queued, being decoded, or
+    /// decoded and waiting for their turn. Each holds its compressed input and, once decoded, its
+    /// whole decompressed output, so the memory the reader needs grows with the number of workers
+    /// and the size of the largest work unit, not with the size of the stream.
     pub fn new(inner: R, dict_size: u32, preset_dict: Option<&[u8]>, num_workers: u32) -> Self {
         let max_workers = num_workers.clamp(1, 256);
 
@@ -211,6 +216,12 @@ impl<R: Read> Lzma2ReaderMt<R> {
         Ok(true)
     }
 
+    /// Units dispatched to the workers and not yet returned to the caller: queued, being
+    /// decoded, in the result channel, or waiting in `out_of_order_chunks`.
+    fn units_in_flight(&self) -> u64 {
+        self.next_sequence_to_dispatch - self.next_sequence_to_return
+    }
+
     fn add_unpacked_size(&mut self, size: usize) -> io::Result<()> {
         let Some(total) = self.current_unit_unpacked.checked_add(size) else {
             return Err(io::Error::new(
@@ -309,7 +320,16 @@ impl<R: Read> Lzma2ReaderMt<R> {
                     // queue is non-empty races with the worker that is about to
                     // steal that unit, and losing the race blocks the reader until
                     // the unit is fully decoded while every other worker idles.
-                    if self.work_queue.len() < self.max_workers as usize {
+                    //
+                    // But never let more than `max_workers + 1` units be in flight:
+                    // a unit that finishes ahead of its turn waits, whole, in
+                    // `out_of_order_chunks`, and while one slow unit holds up the
+                    // order the queue keeps draining, so a queue-length check alone
+                    // let every later unit's output pile up behind it. One read
+                    // dispatches at most one unit, so checking before it is enough.
+                    if self.work_queue.len() < self.max_workers as usize
+                        && self.units_in_flight() <= u64::from(self.max_workers)
+                    {
                         match self.read_and_dispatch_chunk() {
                             Ok(true) => {
                                 // Successfully read and dispatched a chunk, loop to continue.
@@ -498,6 +518,59 @@ impl<R: Read> Drop for Lzma2ReaderMt<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An LZMA2 stream of stored chunks: one work unit of `first_unit` bytes,
+    /// then `small_units` units of one byte each. Every unit starts with a
+    /// dictionary-resetting stored chunk (0x01), the rest of a unit continues
+    /// with stored chunks that keep the dictionary (0x02).
+    fn stored_stream(first_unit: usize, small_units: usize) -> (Vec<u8>, Vec<u8>) {
+        fn stored_chunk(stream: &mut Vec<u8>, control: u8, data: &[u8]) {
+            let size = u16::try_from(data.len() - 1).unwrap().to_be_bytes();
+            stream.push(control);
+            stream.extend_from_slice(&size);
+            stream.extend_from_slice(data);
+        }
+
+        let plain: Vec<u8> = (0..first_unit + small_units)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut stream = Vec::new();
+        for (index, chunk) in plain[..first_unit].chunks(64 * 1024).enumerate() {
+            stored_chunk(&mut stream, if index == 0 { 0x01 } else { 0x02 }, chunk);
+        }
+        for byte in &plain[first_unit..] {
+            stored_chunk(&mut stream, 0x01, core::slice::from_ref(byte));
+        }
+        stream.push(0x00);
+        (stream, plain)
+    }
+
+    /// A slow first unit holds up the order while the small ones behind it
+    /// finish at once. Before the bound, a single read kept dispatching them,
+    /// and every one of them waited, decoded, in `out_of_order_chunks`.
+    #[test]
+    fn a_slow_unit_does_not_let_later_results_pile_up() {
+        let (stream, plain) = stored_stream(32 * 1024 * 1024, 2000);
+        for workers in [1u32, 2, 4] {
+            let mut reader = Lzma2ReaderMt::new(stream.as_slice(), 4096, None, workers);
+            let mut out = Vec::with_capacity(plain.len());
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = reader.read(&mut buf).unwrap();
+                assert!(
+                    reader.units_in_flight() <= u64::from(workers) + 1,
+                    "{workers} workers: {} units in flight",
+                    reader.units_in_flight()
+                );
+                assert!(reader.out_of_order_chunks.len() <= workers as usize);
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            assert!(out == plain, "{workers} workers: output differs");
+        }
+    }
 
     #[test]
     fn rejects_compressed_work_unit_unpacked_size_overflow() {

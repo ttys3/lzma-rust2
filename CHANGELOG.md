@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elsewhere, Windows included; `LZMA2_ASM_DECODER` tells whether it is active. Streams with a preset dictionary keep
   the portable decoder.
 
+### Fixed
+
+- Bound the work units `Lzma2ReaderMt` holds to `num_workers + 1`. Units that finish ahead of their turn are kept,
+  decoded, until the units before them are returned, and the reader kept reading ahead as long as its work queue was
+  shorter than the worker count; one slow unit therefore let the decoded output of every later unit pile up, without
+  limit (2 workers held 796 units in a test stream). The reader now waits for a result instead.
+
 ## 0.21.0 - 2026-09-18
 
 ### Added
