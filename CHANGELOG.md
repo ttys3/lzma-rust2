@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream (Apple M4 Pro); on x86-64 the portable decoder is already fast, so the gain is 1.1-1.25x on text and
   executables (Intel i7-14700KF) and very repetitive input can decode slightly slower. The feature is a no-op
   elsewhere, Windows included; `LZMA2_ASM_DECODER` tells whether it is active. Streams with a preset dictionary keep
-  the portable decoder.
+  the portable decoder. Its dictionary window grows with the output like the portable decoder's, instead of being
+  allocated at the size the stream header declares.
 
 ### Fixed
 

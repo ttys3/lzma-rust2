@@ -27,6 +27,16 @@
 //! - `dic_pos < limit <= dic_buf_size`; when `check_dic_size == 0` the caller
 //!   clamped `limit` so that `processed_pos` cannot pass `dic_size`
 //!   (`LzmaDec_DecodeReal2`);
+//! - `dic` is addressable up to `limit`, and up to `dic_buf_size` once
+//!   `dic_pos` has reached the end of the ring. That covers every byte the
+//!   routine touches: it writes `dic[dic_pos..limit]` and reads at most
+//!   `processed_pos` bytes back (`check_dic_size` once that is set). Until the
+//!   ring wraps, `processed_pos` (bytes since the last dictionary reset) never
+//!   exceeds `dic_pos` (bytes since the first one), and the LZMA2 reader resets
+//!   `reps` after every dictionary reset, so no read reaches below `dic[0]`;
+//!   `check_dic_size` is set only after `dic_size` bytes since a reset, by which
+//!   time the ring is full. [`AsmCore`] grows the window to `limit` before
+//!   every call;
 //! - `probs` holds `1984 + (0x300 << (lc + lp))` entries, and every
 //!   `reps[i]` is in `1..=dic_buf_size` (they are validated back-references
 //!   plus one);
@@ -150,8 +160,12 @@ const _: () = {
 /// 7-Zip's decoder state plus the buffers it points into.
 pub(crate) struct AsmCore {
     dec: CLzmaDec,
-    /// Cyclic dictionary window of `dic_buf_size` bytes.
+    /// Cyclic dictionary window of `dic_buf_size` bytes, of which the first
+    /// `dic_len` are allocated (followed by the debug canary). It grows with
+    /// the output, like the portable `LzDecoder`'s, and reaches `dic_buf_size`
+    /// before `dic_pos` can wrap.
     dic: Vec<u8>,
+    dic_len: usize,
     /// Flat probability array laid out as 7-Zip's C decoder expects; sized
     /// once for the largest `lc + lp`, like `Lzma2Dec_Allocate` does.
     probs: Vec<u16>,
@@ -223,6 +237,7 @@ impl AsmCore {
                 remain_len: 0,
             },
             dic: Vec::new(),
+            dic_len: 0,
             probs: Vec::new(),
             chunk: Vec::new(),
             chunk_len: 0,
@@ -233,16 +248,17 @@ impl AsmCore {
         })
     }
 
-    /// Allocates the dictionary, the probability array and the chunk buffer
-    /// on first use, fallibly, so a huge `dict_size` returns an error instead
-    /// of aborting the process.
+    /// Allocates the probability array and the chunk buffer on first use,
+    /// fallibly. The dictionary is not allocated here: it grows with the
+    /// output ([`Self::grow_dic`]), so memory follows the decoded data rather
+    /// than the dictionary size the stream header declares.
     pub(crate) fn ensure_capacity(&mut self) -> crate::Result<()> {
         if self.allocated {
             return Ok(());
         }
         allocate(
             &mut self.dic,
-            self.dic_buf_size,
+            0,
             0,
             CANARY,
             "dictionary allocation too large",
@@ -262,6 +278,37 @@ impl AsmCore {
             "chunk buffer allocation failed",
         )?;
         self.allocated = true;
+        Ok(())
+    }
+
+    /// Makes `dic[..len]` addressable, growing the window geometrically
+    /// (zero-filled, at least 64 KiB, never past `dic_buf_size`), the rule the
+    /// portable `LzDecoder` follows.
+    #[inline]
+    fn grow_dic(&mut self, len: usize) -> crate::Result<()> {
+        if len <= self.dic_len {
+            return Ok(());
+        }
+        self.grow_dic_slow(len)
+    }
+
+    #[cold]
+    fn grow_dic_slow(&mut self, len: usize) -> crate::Result<()> {
+        const MIN_GROWTH: usize = 64 * 1024;
+        let target = len
+            .max(self.dic_len.saturating_mul(2))
+            .max(MIN_GROWTH)
+            .min(self.dic_buf_size);
+        debug_assert!(target >= len);
+        // Reserve before touching the buffer, so a failure leaves the window
+        // and its canary as they were.
+        self.dic
+            .try_reserve_exact((target + CANARY_LEN).saturating_sub(self.dic.len()))
+            .map_err(|_| error_out_of_memory("dictionary allocation too large"))?;
+        self.dic.truncate(self.dic_len);
+        self.dic.resize(target, 0);
+        self.dic.resize(target + CANARY_LEN, CANARY);
+        self.dic_len = target;
         Ok(())
     }
 
@@ -343,7 +390,7 @@ impl AsmCore {
     /// Debug-build guard bytes after every buffer are still in place (the
     /// guards are empty in release builds, so this is trivially true there).
     fn canaries_intact(&self) -> bool {
-        self.dic[self.dic_buf_size..].iter().all(|&b| b == CANARY)
+        self.dic[self.dic_len..].iter().all(|&b| b == CANARY)
             && self.probs[NUM_PROBS_MAX..].iter().all(|&p| p == CANARY_U16)
             && self.chunk[CHUNK_CAP..].iter().all(|&b| b == CANARY)
     }
@@ -361,6 +408,7 @@ impl AsmCore {
         }
         let start = self.dec.dic_pos;
         let limit = start + out.len().min(self.dic_buf_size - start);
+        self.grow_dic(limit)?;
 
         loop {
             self.write_rem(limit)?;
@@ -381,7 +429,9 @@ impl AsmCore {
             self.refresh_pointers();
             let base = self.chunk.as_ptr();
             // SAFETY: `refresh_pointers` just derived every pointer from the
-            // buffers this struct owns; `lim <= dic_buf_size`; `buf` is inside
+            // buffers this struct owns; `lim <= limit <= dic_len`, and the
+            // reads stay below `dic_pos` until the window, full by then,
+            // wraps (module documentation); `buf` is inside
             // the chunk and `CHUNK_PAD` zero bytes follow `buf_limit`, more
             // than the 20 the routine may read past it; `lc + lp <= 4` sizes
             // the probability array; no reference into the buffers is alive.
@@ -420,7 +470,11 @@ impl AsmCore {
         }
         let dic_buf_size = self.dic_buf_size;
         let rep0 = self.dec.reps[0] as usize;
-        if rep0 == 0 || rep0 > dic_buf_size {
+        // Reaching back across the ring end needs a full window.
+        if rep0 == 0
+            || rep0 > dic_buf_size
+            || (self.dec.dic_pos < rep0 && self.dic_len < dic_buf_size)
+        {
             return Err(error_invalid_data("corrupted input data (LZMA2 match)"));
         }
         if self.dec.check_dic_size == 0
@@ -432,7 +486,7 @@ impl AsmCore {
         self.dec.remain_len -= len as u32;
 
         let mut dic_pos = self.dec.dic_pos;
-        let dic = &mut self.dic[..dic_buf_size];
+        let dic = &mut self.dic[..self.dic_len];
         for _ in 0..len {
             let src = if dic_pos < rep0 {
                 dic_pos + dic_buf_size - rep0
@@ -462,6 +516,7 @@ impl AsmCore {
         if n == 0 {
             return Ok(0);
         }
+        self.grow_dic(pos + n)?;
         inner.read_exact(&mut self.dic[pos..pos + n])?;
         out[..n].copy_from_slice(&self.dic[pos..pos + n]);
         if self.dec.check_dic_size == 0
@@ -617,6 +672,7 @@ mod tests {
         let n = 4096usize;
         let mut core = AsmCore::new(n).unwrap();
         core.ensure_capacity().unwrap();
+        core.grow_dic(n).unwrap();
         let original: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
         core.dic[..n].copy_from_slice(&original);
 
@@ -680,6 +736,64 @@ mod tests {
         assert_eq!(core.copy_uncompressed(&mut src2, &mut out[..8]).unwrap(), 8);
         assert_eq!(core.dec.dic_pos, 8);
         assert_eq!(&core.dic[..8], &more[..]);
+        assert!(core.canaries_intact());
+    }
+
+    #[test]
+    fn the_window_grows_with_the_output() {
+        let mut core = AsmCore::new(1 << 30).unwrap();
+        let data: Vec<u8> = (0..300_000usize).map(|i| (i % 253) as u8).collect();
+        let mut src = &data[..];
+        let mut out = vec![0u8; data.len()];
+
+        assert_eq!(core.copy_uncompressed(&mut src, &mut out[..100]).unwrap(), 100);
+        assert_eq!(core.dic_len, 64 * 1024, "first step");
+        assert_eq!(
+            core.copy_uncompressed(&mut src, &mut out[100..70_000]).unwrap(),
+            69_900
+        );
+        assert_eq!(core.dic_len, 128 * 1024, "doubles");
+        assert_eq!(
+            core.copy_uncompressed(&mut src, &mut out[70_000..]).unwrap(),
+            230_000
+        );
+        assert_eq!(core.dic_len, 300_000, "jumps to what the call needs");
+        assert!(out == data);
+        assert!(core.dic[..data.len()] == data[..]);
+        assert!(core.canaries_intact());
+    }
+
+    #[test]
+    fn the_window_is_full_before_the_ring_wraps() {
+        let n = 256 * 1024;
+        let mut core = AsmCore::new(n).unwrap();
+        let data: Vec<u8> = (0..n + 8).map(|i| (i % 249) as u8).collect();
+        let mut src = &data[..];
+        let mut out = vec![0u8; n];
+        let mut done = 0;
+        while done < n {
+            done += core
+                .copy_uncompressed(&mut src, &mut out[done..(done + 50_000).min(n)])
+                .unwrap();
+            assert!(core.dic_len >= core.dec.dic_pos);
+        }
+        assert_eq!(core.dic_len, n);
+        assert_eq!(core.copy_uncompressed(&mut src, &mut out[..8]).unwrap(), 8);
+        assert_eq!(core.dec.dic_pos, 8, "wrapped");
+        assert_eq!(core.dic_len, n);
+        assert!(core.canaries_intact());
+    }
+
+    #[test]
+    fn write_rem_refuses_to_wrap_a_partial_window() {
+        let mut core = AsmCore::new(1 << 20).unwrap();
+        core.ensure_capacity().unwrap();
+        core.grow_dic(4096).unwrap();
+        core.dec.processed_pos = 100;
+        core.dec.dic_pos = 100;
+        core.dec.reps[0] = 200;
+        core.dec.remain_len = 10;
+        assert!(core.write_rem(200).is_err());
         assert!(core.canaries_intact());
     }
 }
