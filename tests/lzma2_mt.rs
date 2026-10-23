@@ -280,3 +280,181 @@ fn empty_input_decodes_to_nothing() {
         .expect("the reader did not finish");
     assert_eq!(result.unwrap(), 0);
 }
+
+/// Text and pseudo-random bytes in turn, 16 KiB each: the text compresses into LZMA
+/// chunks, the noise is stored as uncompressed chunks.
+fn mixed_data(len: usize) -> Vec<u8> {
+    let text = std::fs::read(PG100).unwrap();
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|i| {
+            if (i / (16 * 1024)) % 2 == 0 {
+                text[i % text.len()]
+            } else {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            }
+        })
+        .collect()
+}
+
+/// A stream of independent 256 KiB work units, several LZMA2 chunks each (half the
+/// data is noise, and a chunk holds at most 64 KiB of compressed data).
+fn multi_unit_stream(data: &[u8]) -> (Vec<u8>, u32) {
+    let unit = 256 * 1024u64;
+    let mut options = Lzma2Options::with_preset(6);
+    options.lzma_options.dict_size = unit as u32;
+    options.set_chunk_size(NonZeroU64::new(unit));
+    let dict_size = options.lzma_options.dict_size;
+    let mut compressed = Vec::new();
+    let mut writer = Lzma2WriterMt::new(&mut compressed, options, 2).unwrap();
+    writer.write_all(data).unwrap();
+    writer.finish().unwrap();
+    (compressed, dict_size)
+}
+
+/// `(end offset in the stream, decompressed bytes up to and including the chunk)` of
+/// every chunk, from the chunk headers.
+fn chunk_ends(stream: &[u8]) -> Vec<(usize, usize)> {
+    let mut ends = Vec::new();
+    let (mut pos, mut unpacked) = (0, 0);
+    while stream[pos] != 0x00 {
+        let control = stream[pos];
+        let size = |at: usize| u16::from_be_bytes([stream[at], stream[at + 1]]) as usize + 1;
+        if control >= 0x80 {
+            unpacked += (((control & 0x1F) as usize) << 16) + size(pos + 1);
+            let header = if control >= 0xC0 { 6 } else { 5 };
+            pos += header + size(pos + 3);
+        } else {
+            unpacked += size(pos + 1);
+            pos += 3 + size(pos + 1);
+        }
+        ends.push((pos, unpacked));
+    }
+    ends
+}
+
+/// Everything the single-threaded reader returns before it fails: one byte per read,
+/// so no read that fails takes decoded bytes down with it.
+fn read_single_threaded(stream: &[u8], dict_size: u32) -> (Vec<u8>, Option<std::io::ErrorKind>) {
+    let mut reader = Lzma2Reader::new(stream, dict_size, None);
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return (out, None),
+            Ok(_) => out.push(byte[0]),
+            Err(error) => return (out, Some(error.kind())),
+        }
+    }
+}
+
+fn read_multi_threaded(
+    stream: &[u8],
+    dict_size: u32,
+    workers: u32,
+) -> (Vec<u8>, Option<std::io::ErrorKind>) {
+    let mut reader = Lzma2ReaderMt::new(stream, dict_size, None, workers);
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 5000];
+    let result = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break (out, None),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(error) => break (out, Some(error.kind())),
+        }
+    };
+    if let Some(kind) = result.1 {
+        // A failed stream stays failed.
+        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), kind);
+    }
+    result
+}
+
+/// On a damaged stream the multi-threaded reader returns every chunk before the damage,
+/// in order, then the error the single-threaded reader reports: never fewer whole chunks
+/// (it used to drop the units read ahead, and the decoded part of the failing one), and
+/// nothing the single-threaded reader would not return.
+fn assert_matches_single_threaded(
+    stream: &[u8],
+    dict_size: u32,
+    ends: &[(usize, usize)],
+    damage_at: usize,
+    what: &str,
+) {
+    let clean = ends
+        .iter()
+        .take_while(|&&(end, _)| end <= damage_at)
+        .last()
+        .map_or(0, |&(_, unpacked)| unpacked);
+    let (single, single_error) = read_single_threaded(stream, dict_size);
+    for workers in [1, 2, 4] {
+        let (multi, multi_error) = read_multi_threaded(stream, dict_size, workers);
+        assert_eq!(multi_error, single_error, "{what}, {workers} workers");
+        assert!(
+            single.starts_with(&multi),
+            "{what}, {workers} workers: {} bytes, not a prefix of the single-threaded {}",
+            multi.len(),
+            single.len()
+        );
+        assert!(
+            multi.len() >= clean,
+            "{what}, {workers} workers: {} bytes, fewer than the {clean} before the damage",
+            multi.len()
+        );
+    }
+}
+
+#[test]
+fn truncated_streams_return_every_whole_chunk() {
+    let data = mixed_data(1024 * 1024);
+    let (stream, dict_size) = multi_unit_stream(&data);
+    let ends = chunk_ends(&stream);
+    assert!(ends.len() > 8, "several chunks per unit: {}", ends.len());
+
+    let mut cuts: Vec<usize> = (1..stream.len()).step_by(stream.len() / 40).collect();
+    for &(end, _) in &ends {
+        cuts.extend([end - 1, end, end + 1]);
+    }
+    cuts.retain(|&cut| cut < stream.len());
+    for cut in cuts {
+        let what = format!("cut at {cut}");
+        assert_matches_single_threaded(&stream[..cut], dict_size, &ends, cut, &what);
+    }
+}
+
+#[test]
+fn corrupt_chunks_return_every_chunk_before_them() {
+    let data = mixed_data(1024 * 1024);
+    let (stream, dict_size) = multi_unit_stream(&data);
+    let ends = chunk_ends(&stream);
+
+    for at in (7..stream.len() - 1).step_by(stream.len() / 40) {
+        let mut damaged = stream.clone();
+        damaged[at] ^= 0x55;
+        let what = format!("flip at {at}");
+        assert_matches_single_threaded(&damaged, dict_size, &ends, at, &what);
+    }
+    for &(end, _) in &ends {
+        if stream[end] == 0x00 {
+            continue;
+        }
+        let mut damaged = stream.clone();
+        damaged[end] = 0x03; // not a control byte
+        let what = format!("control at {end}");
+        assert_matches_single_threaded(&damaged, dict_size, &ends, end, &what);
+    }
+}
+
+#[test]
+fn a_clean_stream_still_decodes_whole() {
+    let data = mixed_data(1024 * 1024);
+    let (stream, dict_size) = multi_unit_stream(&data);
+    for workers in [1, 2, 4] {
+        let (out, error) = read_multi_threaded(&stream, dict_size, workers);
+        assert_eq!(error, None);
+        assert!(out == data);
+    }
+}
