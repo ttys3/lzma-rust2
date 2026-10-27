@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use lzma_rust2::{Lzma2Options, Lzma2Reader, Lzma2ReaderMt, Lzma2WriterMt};
+use lzma_rust2::{Lzma2Options, Lzma2Reader, Lzma2ReaderMt, Lzma2Writer, Lzma2WriterMt};
 
 static EXECUTABLE: &str = "tests/data/executable.exe";
 static PG100: &str = "tests/data/pg100.txt";
@@ -351,12 +351,36 @@ fn read_single_threaded(stream: &[u8], dict_size: u32) -> (Vec<u8>, Option<std::
     }
 }
 
+/// A stream of independent work units of the given sizes, each encoded on its own, so
+/// that unit sizes need not be uniform.
+fn units_stream(data: &[u8], sizes: &[usize], dict_size: u32) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let mut at = 0;
+    for &size in sizes {
+        let mut options = Lzma2Options::with_preset(1);
+        options.lzma_options.dict_size = dict_size;
+        let mut writer = Lzma2Writer::new(Vec::new(), options);
+        writer.write_all(&data[at..at + size]).unwrap();
+        let unit = writer.finish().unwrap();
+        // Every unit but the last loses its end marker.
+        assert_eq!(unit.last(), Some(&0x00));
+        stream.extend_from_slice(&unit[..unit.len() - 1]);
+        at += size;
+    }
+    stream.push(0x00);
+    stream
+}
+
 fn read_multi_threaded(
     stream: &[u8],
     dict_size: u32,
     workers: u32,
+    budget: Option<u64>,
 ) -> (Vec<u8>, Option<std::io::ErrorKind>) {
-    let mut reader = Lzma2ReaderMt::new(stream, dict_size, None, workers);
+    let mut reader = match budget {
+        Some(budget) => Lzma2ReaderMt::with_memory_budget(stream, dict_size, None, workers, budget),
+        None => Lzma2ReaderMt::new(stream, dict_size, None, workers),
+    };
     let mut out = Vec::new();
     let mut buf = vec![0u8; 5000];
     let result = loop {
@@ -377,9 +401,13 @@ fn read_multi_threaded(
 /// in order, then the error the single-threaded reader reports: never fewer whole chunks
 /// (it used to drop the units read ahead, and the decoded part of the failing one), and
 /// nothing the single-threaded reader would not return.
+///
+/// Each budget also takes the path where the units from some point on are decoded on the
+/// calling thread: `Some(0)` from the start, the others where a unit does not fit.
 fn assert_matches_single_threaded(
     stream: &[u8],
     dict_size: u32,
+    budgets: &[Option<u64>],
     ends: &[(usize, usize)],
     damage_at: usize,
     what: &str,
@@ -390,21 +418,37 @@ fn assert_matches_single_threaded(
         .last()
         .map_or(0, |&(_, unpacked)| unpacked);
     let (single, single_error) = read_single_threaded(stream, dict_size);
-    for workers in [1, 2, 4] {
-        let (multi, multi_error) = read_multi_threaded(stream, dict_size, workers);
-        assert_eq!(multi_error, single_error, "{what}, {workers} workers");
-        assert!(
-            single.starts_with(&multi),
-            "{what}, {workers} workers: {} bytes, not a prefix of the single-threaded {}",
-            multi.len(),
-            single.len()
-        );
-        assert!(
-            multi.len() >= clean,
-            "{what}, {workers} workers: {} bytes, fewer than the {clean} before the damage",
-            multi.len()
-        );
+    for &budget in budgets {
+        for workers in [1, 2, 4] {
+            let (multi, multi_error) = read_multi_threaded(stream, dict_size, workers, budget);
+            let what = format!("{what}, {workers} workers, budget {budget:?}");
+            assert_eq!(multi_error, single_error, "{what}");
+            assert!(
+                single.starts_with(&multi),
+                "{what}: {} bytes, not a prefix of the single-threaded {}",
+                multi.len(),
+                single.len()
+            );
+            assert!(
+                multi.len() >= clean,
+                "{what}: {} bytes, fewer than the {clean} before the damage",
+                multi.len()
+            );
+        }
     }
+}
+
+/// Unit sizes in KiB for a stream whose fifth unit does not fit a 1 MiB budget on its
+/// own, so the reader hands over in the middle of it.
+const UNEVEN_UNITS_KIB: [usize; 9] = [64, 64, 64, 64, 768, 64, 64, 64, 64];
+const UNEVEN_BUDGETS: [Option<u64>; 3] = [None, Some(0), Some(1024 * 1024)];
+const UNIFORM_BUDGETS: [Option<u64>; 3] = [None, Some(0), Some(2 * 1024 * 1024)];
+
+fn uneven_stream() -> (Vec<u8>, u32, Vec<u8>) {
+    let sizes: Vec<usize> = UNEVEN_UNITS_KIB.iter().map(|kib| kib * 1024).collect();
+    let data = mixed_data(sizes.iter().sum());
+    let dict_size = 256 * 1024;
+    (units_stream(&data, &sizes, dict_size), dict_size, data)
 }
 
 #[test]
@@ -421,7 +465,31 @@ fn truncated_streams_return_every_whole_chunk() {
     cuts.retain(|&cut| cut < stream.len());
     for cut in cuts {
         let what = format!("cut at {cut}");
-        assert_matches_single_threaded(&stream[..cut], dict_size, &ends, cut, &what);
+        assert_matches_single_threaded(
+            &stream[..cut],
+            dict_size,
+            &UNIFORM_BUDGETS,
+            &ends,
+            cut,
+            &what,
+        );
+    }
+}
+
+#[test]
+fn truncated_uneven_streams_return_every_whole_chunk() {
+    let (stream, dict_size, _) = uneven_stream();
+    let ends = chunk_ends(&stream);
+    for cut in (1..stream.len()).step_by(stream.len() / 60) {
+        let what = format!("cut at {cut}");
+        assert_matches_single_threaded(
+            &stream[..cut],
+            dict_size,
+            &UNEVEN_BUDGETS,
+            &ends,
+            cut,
+            &what,
+        );
     }
 }
 
@@ -435,7 +503,7 @@ fn corrupt_chunks_return_every_chunk_before_them() {
         let mut damaged = stream.clone();
         damaged[at] ^= 0x55;
         let what = format!("flip at {at}");
-        assert_matches_single_threaded(&damaged, dict_size, &ends, at, &what);
+        assert_matches_single_threaded(&damaged, dict_size, &UNIFORM_BUDGETS, &ends, at, &what);
     }
     for &(end, _) in &ends {
         if stream[end] == 0x00 {
@@ -444,7 +512,19 @@ fn corrupt_chunks_return_every_chunk_before_them() {
         let mut damaged = stream.clone();
         damaged[end] = 0x03; // not a control byte
         let what = format!("control at {end}");
-        assert_matches_single_threaded(&damaged, dict_size, &ends, end, &what);
+        assert_matches_single_threaded(&damaged, dict_size, &UNIFORM_BUDGETS, &ends, end, &what);
+    }
+}
+
+#[test]
+fn corrupt_uneven_streams_return_every_chunk_before_them() {
+    let (stream, dict_size, _) = uneven_stream();
+    let ends = chunk_ends(&stream);
+    for at in (7..stream.len() - 1).step_by(stream.len() / 60) {
+        let mut damaged = stream.clone();
+        damaged[at] ^= 0x55;
+        let what = format!("flip at {at}");
+        assert_matches_single_threaded(&damaged, dict_size, &UNEVEN_BUDGETS, &ends, at, &what);
     }
 }
 
@@ -452,9 +532,91 @@ fn corrupt_chunks_return_every_chunk_before_them() {
 fn a_clean_stream_still_decodes_whole() {
     let data = mixed_data(1024 * 1024);
     let (stream, dict_size) = multi_unit_stream(&data);
-    for workers in [1, 2, 4] {
-        let (out, error) = read_multi_threaded(&stream, dict_size, workers);
-        assert_eq!(error, None);
-        assert!(out == data);
+    for budget in UNIFORM_BUDGETS {
+        for workers in [1, 2, 4] {
+            let (out, error) = read_multi_threaded(&stream, dict_size, workers, budget);
+            assert_eq!(error, None);
+            assert!(out == data, "{workers} workers, budget {budget:?}");
+        }
+    }
+}
+
+/// Whatever the unit layout, the number of workers and the budget, the output is the
+/// single-threaded reader's.
+#[test]
+fn budgets_never_change_the_output() {
+    const KIB: usize = 1024;
+    let layouts: [&[usize]; 5] = [
+        // Small units, then large ones.
+        &[16 * KIB, 16 * KIB, 16 * KIB, 16 * KIB, 512 * KIB, 512 * KIB],
+        // Large and small in turn.
+        &[512 * KIB, 1, 512 * KIB, 1, 512 * KIB, 1],
+        // One unit only.
+        &[1536 * KIB],
+        // Many tiny units.
+        &[1; 300],
+        // A unit past the cap for its dictionary (1 MiB for 256 KiB).
+        &[64 * KIB, 1100 * KIB, 64 * KIB],
+    ];
+    let budgets = [
+        None,
+        Some(0),
+        Some(256 * 1024),
+        Some(1024 * 1024),
+        Some(3 * 1024 * 1024),
+        Some(u64::MAX),
+    ];
+    let dict_size = 256 * 1024;
+    for (index, layout) in layouts.iter().enumerate() {
+        let data = mixed_data(layout.iter().sum());
+        let stream = units_stream(&data, layout, dict_size);
+        let mut single = Vec::new();
+        Lzma2Reader::new(stream.as_slice(), dict_size, None)
+            .read_to_end(&mut single)
+            .unwrap();
+        assert!(single == data, "layout {index}");
+        for budget in budgets {
+            for workers in [1, 2, 4] {
+                let (out, error) = read_multi_threaded(&stream, dict_size, workers, budget);
+                assert_eq!(
+                    error, None,
+                    "layout {index}, {workers} workers, budget {budget:?}"
+                );
+                assert!(
+                    out == data,
+                    "layout {index}, {workers} workers, budget {budget:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The uneven stream exercises what its tests are for: the reader hands over at the unit
+/// that does not fit, not before it.
+#[test]
+fn the_uneven_stream_hands_over_at_its_large_unit() {
+    let (stream, dict_size, data) = uneven_stream();
+    let expected = [(None, 9), (Some(0), 0), (Some(1024 * 1024), 4)];
+    for (budget, units_on_workers) in expected {
+        for workers in [1, 2, 4] {
+            let mut reader = match budget {
+                Some(budget) => Lzma2ReaderMt::with_memory_budget(
+                    stream.as_slice(),
+                    dict_size,
+                    None,
+                    workers,
+                    budget,
+                ),
+                None => Lzma2ReaderMt::new(stream.as_slice(), dict_size, None, workers),
+            };
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            assert!(out == data);
+            assert_eq!(
+                reader.chunk_count(),
+                units_on_workers,
+                "{workers} workers, budget {budget:?}"
+            );
+        }
     }
 }

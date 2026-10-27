@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elsewhere, Windows included; `LZMA2_ASM_DECODER` tells whether it is active. Streams with a preset dictionary keep
   the portable decoder. Its dictionary window grows with the output like the portable decoder's, instead of being
   allocated at the size the stream header declares.
+- `Lzma2ReaderMt::with_memory_budget` bounds, in bytes, what the reader holds to decode in parallel: the compressed
+  input of the work units gathered and in flight, their output until the caller has read it, and the decoder of each
+  unit (its window grows with the unit's output). When the next chunk does not fit, the reader stops reading ahead
+  until earlier output has been read. A unit that does not fit on its own, or that grows past the size 7-Zip's
+  encoder gives a unit for the dictionary (`4 * dict_size`, clamped to 1-256 MiB, at least `dict_size`), is decoded on
+  the calling thread with the rest of the stream, after the units before it, as 7-Zip's decoder does.
 
 ### Fixed
 

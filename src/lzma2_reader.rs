@@ -350,6 +350,19 @@ impl<R: Read> Lzma2Reader<R> {
 
 impl<R: Read> Read for Lzma2Reader<R> {
     fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+        self.read_chunks(buf, false)
+    }
+}
+
+impl<R: Read> Lzma2Reader<R> {
+    /// Like [`Read::read`], but returns at the end of every chunk, so a chunk that fails
+    /// to decode never takes the bytes of the chunks before it down with it: a failed
+    /// call has decoded nothing but part of the failing chunk.
+    pub(crate) fn read_to_chunk_end(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+        self.read_chunks(buf, true)
+    }
+
+    fn read_chunks(&mut self, buf: &mut [u8], stop_at_chunk_end: bool) -> crate::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -387,6 +400,9 @@ impl<R: Read> Read for Lzma2Reader<R> {
             self.uncompressed_size = self.uncompressed_size.saturating_sub(copied_size);
             if self.uncompressed_size == 0 && self.is_lzma_chunk && !self.core.chunk_finished() {
                 return Err(error_invalid_input("rc not finished or lz has pending"));
+            }
+            if stop_at_chunk_end && self.uncompressed_size == 0 {
+                break;
             }
         }
 
