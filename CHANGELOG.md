@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded, until the units before them are returned, and the reader kept reading ahead as long as its work queue was
   shorter than the worker count; one slow unit therefore let the decoded output of every later unit pile up, without
   limit (2 workers held 796 units in a test stream). The reader now waits for a result instead.
+- On corrupt or truncated input `Lzma2ReaderMt` returns every chunk before the damage, in order, then the error
+  `Lzma2Reader` reports there. It used to drop the units read ahead of a failure and the decoded part of the failing
+  one (a 1 MiB stream cut at byte 72,933 came out as 0 bytes on one worker, where 94,437 precede the cut), and later
+  reads reported "decompression failed with an unknown error". A worker that panics now fails its unit instead of
+  leaving the reader waiting for it forever.
 
 ## 0.23.0 - 2026-10-18
 
