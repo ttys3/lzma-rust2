@@ -32,6 +32,9 @@ const UNIT_BUFFER_MIN: usize = 64 * 1024;
 /// The longest chunk header: the control byte, two size fields and the properties byte.
 const CHUNK_HEADER_MAX: usize = 6;
 
+/// The largest decompressed size a chunk header can declare: `(0x1F << 16) + 0x10000`.
+const CHUNK_UNPACKED_MAX: usize = 2 * 1024 * 1024;
+
 const INPUT_HANDED_OVER: &str = "the input is handed over only once nothing more is dispatched";
 
 /// How often a reader waiting for a worker checks its cancellation flag.
@@ -863,7 +866,6 @@ fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> UnitOutput {
             )),
         );
     }
-    decompressed_data.resize(unit.unpacked, 0);
 
     let mut filled = 0;
     while filled < unit.unpacked {
@@ -872,6 +874,13 @@ fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> UnitOutput {
         if context.shutdown_flag.load(Ordering::Acquire) {
             return (Vec::new(), Some(io::Error::other("LZMA2 reader shut down")));
         }
+        // Initialise only the room the next chunk can fill. Zeroing the whole unit up
+        // front (256 MiB for the largest units 7-Zip writes: 70 ms on one thread, several
+        // times that on many at once) came before the first check of the flag above, and
+        // the reader's drop waits for it. `filled` is at a chunk boundary and no chunk is
+        // larger than this, so every read below still ends at the end of a chunk.
+        let end = filled + (unit.unpacked - filled).min(CHUNK_UNPACKED_MAX);
+        decompressed_data.resize(end, 0);
         let error = match reader.read_to_chunk_end(&mut decompressed_data[filled..]) {
             Ok(0) => io::Error::new(
                 io::ErrorKind::UnexpectedEof,

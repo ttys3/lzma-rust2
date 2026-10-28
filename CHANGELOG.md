@@ -44,7 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dropping `Lzma2ReaderMt`, or a read of it that fails, stops its workers at the end of the chunk they are decoding and
   drops the units still queued, and the drop waits for the workers to exit. They used to decode the rest of their unit
   on detached threads, up to 256 MiB of output each for the largest units 7-Zip writes, holding memory nothing would
-  read and that no budget counted.
+  read and that no budget counted. A worker zeroes its output one chunk ahead of the decoder rather than the whole unit
+  before it starts, so one that has just taken a unit stops as soon too (zeroing a 256 MiB unit takes 70 ms on one
+  thread, more on several at once).
 
 ## 0.23.0 - 2026-10-18
 
