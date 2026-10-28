@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one (a 1 MiB stream cut at byte 72,933 came out as 0 bytes on one worker, where 94,437 precede the cut), and later
   reads reported "decompression failed with an unknown error". A worker that panics now fails its unit instead of
   leaving the reader waiting for it forever.
+- Dropping `Lzma2ReaderMt`, or a read of it that fails, stops its workers at the end of the chunk they are decoding and
+  drops the units still queued, and the drop waits for the workers to exit. They used to decode the rest of their unit
+  on detached threads, up to 256 MiB of output each for the largest units 7-Zip writes, holding memory nothing would
+  read and that no budget counted.
 
 ## 0.23.0 - 2026-10-18
 

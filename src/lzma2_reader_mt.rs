@@ -50,6 +50,10 @@ struct UnitResult {
     error: Option<io::Error>,
 }
 
+/// A unit's output: the bytes of every chunk that decoded cleanly, and the error that
+/// stopped it, if one did.
+type UnitOutput = (Vec<u8>, Option<io::Error>);
+
 /// A chunk whose header has been read and whose data has not.
 #[derive(Clone, Copy)]
 struct ChunkHeader {
@@ -134,7 +138,7 @@ pub struct Lzma2ReaderMt<R: Read> {
     next_sequence_to_dispatch: u64,
     next_sequence_to_return: u64,
     last_sequence_id: Option<u64>,
-    out_of_order_chunks: BTreeMap<u64, (Vec<u8>, Option<io::Error>)>,
+    out_of_order_chunks: BTreeMap<u64, UnitOutput>,
     current_chunk: Cursor<Vec<u8>>,
     /// The error that ended the unit `current_chunk` holds, reported once it is read out.
     pending_error: Option<io::Error>,
@@ -162,9 +166,8 @@ pub struct Lzma2ReaderMt<R: Read> {
     dict_size: u32,
     preset_dict: Option<Arc<Vec<u8>>>,
     worker_handles: Vec<thread::JoinHandle<()>>,
-    /// A worker panics when it takes this unit, to exercise the panic path.
     #[cfg(test)]
-    panic_on_unit: Option<u64>,
+    hooks: TestHooks,
 }
 
 impl<R: Read> Lzma2ReaderMt<R> {
@@ -184,6 +187,9 @@ impl<R: Read> Lzma2ReaderMt<R> {
     /// On corrupt or truncated input the reader returns what [`Lzma2Reader`] would decode
     /// before the damage, at chunk granularity: every chunk before the first one that fails
     /// to decode or could not be read in full, in order, then the error.
+    ///
+    /// Dropping the reader stops its workers at the end of the chunk they are decoding and
+    /// waits for them to exit.
     pub fn new(inner: R, dict_size: u32, preset_dict: Option<&[u8]>, num_workers: u32) -> Self {
         Self::with_options(
             inner,
@@ -193,7 +199,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             u64::MAX,
             None,
             #[cfg(test)]
-            None,
+            TestHooks::default(),
         )
     }
 
@@ -232,7 +238,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             budget,
             Some(max_unit_size(dict_size)),
             #[cfg(test)]
-            None,
+            TestHooks::default(),
         )
     }
 
@@ -243,7 +249,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
         num_workers: u32,
         budget: u64,
         unit_cap: Option<usize>,
-        #[cfg(test)] panic_on_unit: Option<u64>,
+        #[cfg(test)] hooks: TestHooks,
     ) -> Self {
         let max_workers = num_workers.clamp(1, 256);
 
@@ -283,7 +289,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             preset_dict,
             worker_handles: Vec::new(),
             #[cfg(test)]
-            panic_on_unit,
+            hooks,
         };
 
         reader.spawn_worker_thread();
@@ -300,7 +306,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             shutdown_flag: Arc::clone(&self.shutdown_flag),
             active_workers: Arc::clone(&self.active_workers),
             #[cfg(test)]
-            panic_on_unit: self.panic_on_unit,
+            hooks: self.hooks.clone(),
         };
 
         let handle = thread::spawn(move || worker_thread_logic(worker_handle, context));
@@ -577,7 +583,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
 
     /// The next unit's output, in order: its bytes and the error that ended it early.
     /// `None` once every unit there is has been returned.
-    fn next_unit(&mut self) -> Option<(Vec<u8>, Option<io::Error>)> {
+    fn next_unit(&mut self) -> Option<UnitOutput> {
         loop {
             // Always check for already-received chunks first.
             if let Some(result) = self
@@ -668,13 +674,20 @@ impl<R: Read> Lzma2ReaderMt<R> {
         }
     }
 
-    /// Ends the stream with `error`. Nothing after the failure is needed any more, so the
-    /// workers stop once their current unit is done.
+    /// Ends the stream with `error`. Nothing after the failure is needed any more.
     fn fail(&mut self, error: io::Error) -> io::Error {
         self.state = State::Failed(error.kind(), error.to_string());
-        self.shutdown_flag.store(true, Ordering::Release);
-        self.work_queue.close();
+        self.stop_workers();
         error
+    }
+
+    /// Nothing the workers decode is needed any more: queued units are dropped, and each
+    /// worker stops at the end of the chunk it is decoding instead of the end of its unit,
+    /// which can be hundreds of MiB further on.
+    fn stop_workers(&self) {
+        self.shutdown_flag.store(true, Ordering::Release);
+        self.work_queue.discard_pending();
+        self.work_queue.close();
     }
 }
 
@@ -696,7 +709,20 @@ struct WorkerContext {
     shutdown_flag: Arc<AtomicBool>,
     active_workers: Arc<AtomicU32>,
     #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// Ways for tests to steer the workers.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestHooks {
+    /// A worker panics when it takes this unit, to exercise the panic path.
     panic_on_unit: Option<u64>,
+    /// A worker that takes this unit holds it until the reader shuts down, as a long
+    /// decode would.
+    stall_on_unit: Option<u64>,
+    /// Counts the worker threads that have returned.
+    workers_exited: Arc<AtomicU32>,
 }
 
 /// The logic for a single worker thread.
@@ -727,14 +753,22 @@ fn worker_thread_logic(worker_handle: WorkerHandle<WorkUnit>, context: WorkerCon
             break;
         }
     }
+    #[cfg(test)]
+    context.hooks.workers_exited.fetch_add(1, Ordering::Release);
 }
 
 /// Decodes one work unit. Every read returns at the end of a chunk, so a failure keeps
 /// exactly the chunks before the one that failed.
-fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> (Vec<u8>, Option<io::Error>) {
+fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> UnitOutput {
     #[cfg(test)]
-    if context.panic_on_unit == Some(unit.seq) {
+    if context.hooks.panic_on_unit == Some(unit.seq) {
         panic!("test panic in work unit {}", unit.seq);
+    }
+    #[cfg(test)]
+    if context.hooks.stall_on_unit == Some(unit.seq) {
+        while !context.shutdown_flag.load(Ordering::Acquire) {
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     let mut reader = Lzma2Reader::new(
@@ -760,6 +794,11 @@ fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> (Vec<u8>, Option<io::
 
     let mut filled = 0;
     while filled < unit.unpacked {
+        // Once the reader has failed or been dropped, nothing this unit produces
+        // is needed. Its output is freed before the result goes out.
+        if context.shutdown_flag.load(Ordering::Acquire) {
+            return (Vec::new(), Some(io::Error::other("LZMA2 reader shut down")));
+        }
         let error = match reader.read_to_chunk_end(&mut decompressed_data[filled..]) {
             Ok(0) => io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -851,10 +890,15 @@ impl<R: Read> Read for Lzma2ReaderMt<R> {
 
 impl<R: Read> Drop for Lzma2ReaderMt<R> {
     fn drop(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Release);
-        self.work_queue.close();
-        // Worker threads will exit when the work queue is closed.
-        // JoinHandles will be dropped, which is fine since we set the shutdown flag,
+        self.stop_workers();
+        // Disconnect before joining: a worker may be blocked sending a result.
+        let (_, disconnected) = mpsc::sync_channel(0);
+        drop(core::mem::replace(&mut self.result_rx, disconnected));
+        // Each worker stops at the end of its chunk, so once the reader is gone, so are
+        // its threads and the memory they held.
+        for handle in self.worker_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1035,7 +1079,10 @@ mod tests {
                 2,
                 u64::MAX,
                 None,
-                Some(2),
+                TestHooks {
+                    panic_on_unit: Some(2),
+                    ..TestHooks::default()
+                },
             );
             let mut out = Vec::new();
             let error = reader.read_to_end(&mut out).unwrap_err();
@@ -1047,6 +1094,68 @@ mod tests {
             .expect("the reader did not finish");
         assert!(out == plain[..64 * 1024 + 1], "units 0 and 1");
         assert_eq!(message, "LZMA2 worker thread panicked");
+    }
+
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Dropping the reader while a worker decodes a unit does not leave the worker
+    /// running: the drop waits for every worker thread to exit.
+    #[test]
+    fn dropping_the_reader_stops_and_joins_its_workers() {
+        let (stream, _) = stored_stream(64 * 1024, 3);
+        let hooks = TestHooks {
+            stall_on_unit: Some(0),
+            ..TestHooks::default()
+        };
+        let workers_exited = Arc::clone(&hooks.workers_exited);
+        let mut reader =
+            Lzma2ReaderMt::with_options(Cursor::new(stream), 4096, None, 2, u64::MAX, None, hooks);
+        // Gather unit 0; the next chunk's header dispatches it.
+        reader.pending_chunk = reader.read_chunk_header().unwrap();
+        assert!(matches!(
+            reader.place_pending_chunk().unwrap(),
+            Placement::Placed
+        ));
+        reader.pending_chunk = reader.read_chunk_header().unwrap();
+        assert_eq!(reader.next_sequence_to_dispatch, 1);
+        let start = std::time::Instant::now();
+        while reader.active_workers.load(Ordering::Acquire) == 0 {
+            assert!(start.elapsed() < DEADLINE, "no worker took unit 0");
+            thread::yield_now();
+        }
+
+        let spawned = reader.worker_handles.len();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            drop(reader);
+            let _ = sender.send(());
+        });
+        receiver.recv_timeout(DEADLINE).expect("the drop hung");
+        assert_eq!(workers_exited.load(Ordering::Acquire) as usize, spawned);
+    }
+
+    /// A worker stops at the next chunk boundary once the reader has shut down, and frees
+    /// what it decoded so far.
+    #[test]
+    fn a_worker_stops_between_chunks_once_the_reader_shuts_down() {
+        let (stream, _) = stored_stream(256 * 1024, 0);
+        let (result_tx, _result_rx) = mpsc::sync_channel(1);
+        let context = WorkerContext {
+            result_tx,
+            dict_size: 4096,
+            preset_dict: None,
+            shutdown_flag: Arc::new(AtomicBool::new(true)),
+            active_workers: Arc::new(AtomicU32::new(0)),
+            hooks: TestHooks::default(),
+        };
+        let unit = WorkUnit {
+            seq: 0,
+            data: stream,
+            unpacked: 256 * 1024,
+        };
+        let (data, error) = decode_unit(unit, &context);
+        assert!(data.is_empty());
+        assert_eq!(error.unwrap().to_string(), "LZMA2 reader shut down");
     }
 
     #[test]
