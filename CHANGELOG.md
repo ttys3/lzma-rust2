@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until earlier output has been read. A unit that does not fit on its own, or that grows past the size 7-Zip's
   encoder gives a unit for the dictionary (`4 * dict_size`, clamped to 1-256 MiB, at least `dict_size`), is decoded on
   the calling thread with the rest of the stream, after the units before it, as 7-Zip's decoder does.
+- `Lzma2ReaderMt::set_cancellation` takes a shared flag. Once it is set, a read returns an I/O error carrying
+  `DecoderCancelled`, and so does every later read; a read that waits for a worker checks the flag every 50 ms, and the
+  workers stop at the end of the chunk they are decoding. Without it such a read returns only once the work unit it
+  waits for is decoded, seconds for a 256 MiB unit.
 
 ### Fixed
 

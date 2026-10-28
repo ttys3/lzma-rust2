@@ -1,10 +1,15 @@
 use std::{
     io::{Cursor, Read, Write},
     num::{NonZero, NonZeroU64},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use lzma_rust2::{Lzma2Options, Lzma2Reader, Lzma2ReaderMt, Lzma2Writer, Lzma2WriterMt};
+use lzma_rust2::{
+    DecoderCancelled, Lzma2Options, Lzma2Reader, Lzma2ReaderMt, Lzma2Writer, Lzma2WriterMt,
+};
 
 static EXECUTABLE: &str = "tests/data/executable.exe";
 static PG100: &str = "tests/data/pg100.txt";
@@ -69,6 +74,38 @@ fn flush_writes_out_every_chunk() {
             .unwrap();
 
         assert!(uncompressed == data[..written]);
+    }
+}
+
+/// Setting the cancellation flag ends a multi-threaded read mid-stream with an error that
+/// carries `DecoderCancelled`, for this read and every later one.
+#[test]
+fn cancellation_ends_a_multi_threaded_read() {
+    let data = std::fs::read(PG100).unwrap();
+    let chunk_size = 256 * 1024;
+    let mut options = Lzma2Options::with_preset(1);
+    options.lzma_options.dict_size = chunk_size as u32;
+    options.set_chunk_size(NonZeroU64::new(chunk_size));
+    let mut writer = Lzma2WriterMt::new(Vec::new(), options, 4).unwrap();
+    writer.write_all(&data).unwrap();
+    let compressed = writer.finish().unwrap();
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut reader = Lzma2ReaderMt::new(compressed.as_slice(), chunk_size as u32, None, 4);
+    reader.set_cancellation(Arc::clone(&flag));
+    let mut out = vec![0u8; 64 * 1024];
+    reader.read_exact(&mut out).unwrap();
+    assert!(out == data[..out.len()]);
+
+    flag.store(true, Ordering::Relaxed);
+    for _ in 0..2 {
+        let error = reader.read(&mut out).unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<DecoderCancelled>()),
+            "{error}"
+        );
     }
 }
 

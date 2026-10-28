@@ -6,9 +6,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
     thread,
+    time::Duration,
 };
 
 use crate::{
@@ -32,6 +33,21 @@ const UNIT_BUFFER_MIN: usize = 64 * 1024;
 const CHUNK_HEADER_MAX: usize = 6;
 
 const INPUT_HANDED_OVER: &str = "the input is handed over only once nothing more is dispatched";
+
+/// How often a reader waiting for a worker checks its cancellation flag.
+const CANCELLATION_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Cooperative decoder cancellation, carried through the reader's I/O result.
+#[derive(Debug)]
+pub struct DecoderCancelled;
+
+impl std::fmt::Display for DecoderCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("decoder cancelled")
+    }
+}
+
+impl std::error::Error for DecoderCancelled {}
 
 /// A work unit for a worker thread: its sequence number, the raw compressed bytes of a
 /// series of chunks that starts with a dictionary reset, and their decompressed size
@@ -122,6 +138,8 @@ enum State {
     Finished,
     /// The stream failed; every further read reports the same error again.
     Failed(io::ErrorKind, String),
+    /// The caller cancelled the stream; every further read reports [`DecoderCancelled`].
+    Cancelled,
 }
 
 /// A multi-threaded LZMA2 decompressor.
@@ -159,6 +177,8 @@ pub struct Lzma2ReaderMt<R: Read> {
     /// The decoder of the rest of the stream, once it has taken over.
     single: Option<Lzma2Reader<Resume<R>>>,
     shutdown_flag: Arc<AtomicBool>,
+    /// The caller's flag, set to request cancellation.
+    cancellation: Option<Arc<AtomicBool>>,
     state: State,
     work_queue: WorkStealingQueue<WorkUnit>,
     active_workers: Arc<AtomicU32>,
@@ -189,7 +209,8 @@ impl<R: Read> Lzma2ReaderMt<R> {
     /// to decode or could not be read in full, in order, then the error.
     ///
     /// Dropping the reader stops its workers at the end of the chunk they are decoding and
-    /// waits for them to exit.
+    /// waits for them to exit. Use [`Lzma2ReaderMt::set_cancellation`] to stop a read that
+    /// waits for a worker.
     pub fn new(inner: R, dict_size: u32, preset_dict: Option<&[u8]>, num_workers: u32) -> Self {
         Self::with_options(
             inner,
@@ -281,6 +302,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
             hand_over: None,
             single: None,
             shutdown_flag,
+            cancellation: None,
             state: State::Reading,
             work_queue,
             active_workers,
@@ -295,6 +317,25 @@ impl<R: Read> Lzma2ReaderMt<R> {
         reader.spawn_worker_thread();
 
         reader
+    }
+
+    /// Sets a shared cancellation flag.
+    ///
+    /// Setting the flag to `true` requests cancellation. The reader checks it on every
+    /// read, and every 50 ms while it waits for a worker: the read returns an I/O error
+    /// carrying [`DecoderCancelled`], and so does every read after it. The workers stop
+    /// at the end of the chunk they are decoding.
+    ///
+    /// Without a flag, a read that waits for a work unit returns only once the unit has
+    /// been decoded, which for the largest units 7-Zip writes (256 MiB) takes seconds.
+    pub fn set_cancellation(&mut self, flag: Arc<AtomicBool>) {
+        self.cancellation = Some(flag);
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 
     fn spawn_worker_thread(&mut self) {
@@ -581,10 +622,40 @@ impl<R: Read> Lzma2ReaderMt<R> {
             .insert(result.seq, (result.data, result.error));
     }
 
+    /// Waits for a worker's result and files it. Every dispatched unit yields one, a worker
+    /// panic included. With a cancellation flag the wait wakes up to check it.
+    fn wait_for_result(&mut self) -> Result<(), DecoderCancelled> {
+        if self.cancellation.is_none() {
+            if let Ok(result) = self.result_rx.recv() {
+                self.accept_result(result);
+            }
+            return Ok(());
+        }
+        loop {
+            if self.cancellation_requested() {
+                return Err(DecoderCancelled);
+            }
+            match self.result_rx.recv_timeout(CANCELLATION_CHECK_INTERVAL) {
+                Ok(result) => {
+                    self.accept_result(result);
+                    return Ok(());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                // The reader holds a sender itself, so the channel never disconnects.
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+
     /// The next unit's output, in order: its bytes and the error that ended it early.
     /// `None` once every unit there is has been returned.
-    fn next_unit(&mut self) -> Option<UnitOutput> {
+    fn next_unit(&mut self) -> Result<Option<UnitOutput>, DecoderCancelled> {
         loop {
+            // Reading ahead can take many rounds of this loop before anything is returned.
+            if self.cancellation_requested() {
+                return Err(DecoderCancelled);
+            }
+
             // Always check for already-received chunks first.
             if let Some(result) = self
                 .out_of_order_chunks
@@ -594,7 +665,7 @@ impl<R: Read> Lzma2ReaderMt<R> {
                 if let Some(charge) = self.unit_charges.pop_front() {
                     self.in_flight_bytes -= charge;
                 }
-                return Some(result);
+                return Ok(Some(result));
             }
 
             match self.state {
@@ -650,26 +721,21 @@ impl<R: Read> Lzma2ReaderMt<R> {
                         continue;
                     }
 
-                    // Now we MUST wait for a result to make progress. Every
-                    // dispatched unit yields one, a worker panic included.
-                    if let Ok(result) = self.result_rx.recv() {
-                        self.accept_result(result);
-                    }
+                    // Now we MUST wait for a result to make progress.
+                    self.wait_for_result()?;
                 }
                 State::Draining => {
                     if self
                         .last_sequence_id
                         .is_none_or(|last| self.next_sequence_to_return > last)
                     {
-                        return None;
+                        return Ok(None);
                     }
 
                     // In Draining state, we only wait for results.
-                    if let Ok(result) = self.result_rx.recv() {
-                        self.accept_result(result);
-                    }
+                    self.wait_for_result()?;
                 }
-                State::Finished | State::Failed(..) => return None,
+                State::Finished | State::Failed(..) | State::Cancelled => return Ok(None),
             }
         }
     }
@@ -679,6 +745,13 @@ impl<R: Read> Lzma2ReaderMt<R> {
         self.state = State::Failed(error.kind(), error.to_string());
         self.stop_workers();
         error
+    }
+
+    /// Ends the stream on the caller's request.
+    fn cancel(&mut self) -> io::Error {
+        self.state = State::Cancelled;
+        self.stop_workers();
+        io::Error::other(DecoderCancelled)
     }
 
     /// Nothing the workers decode is needed any more: queued units are dropped, and each
@@ -794,7 +867,7 @@ fn decode_unit(unit: WorkUnit, context: &WorkerContext) -> UnitOutput {
 
     let mut filled = 0;
     while filled < unit.unpacked {
-        // Once the reader has failed or been dropped, nothing this unit produces
+        // Once the reader has failed, been cancelled or dropped, nothing this unit produces
         // is needed. Its output is freed before the result goes out.
         if context.shutdown_flag.load(Ordering::Acquire) {
             return (Vec::new(), Some(io::Error::other("LZMA2 reader shut down")));
@@ -836,8 +909,13 @@ impl<R: Read> Read for Lzma2ReaderMt<R> {
         }
 
         loop {
-            if let State::Failed(kind, message) = &self.state {
-                return Err(io::Error::new(*kind, message.clone()));
+            match &self.state {
+                State::Failed(kind, message) => return Err(io::Error::new(*kind, message.clone())),
+                State::Cancelled => return Err(io::Error::other(DecoderCancelled)),
+                _ => {}
+            }
+            if self.cancellation_requested() {
+                return Err(self.cancel());
             }
 
             if let Some(single) = self.single.as_mut() {
@@ -860,11 +938,12 @@ impl<R: Read> Read for Lzma2ReaderMt<R> {
             }
 
             match self.next_unit() {
-                Some((data, error)) => {
+                Err(DecoderCancelled) => return Err(self.cancel()),
+                Ok(Some((data, error))) => {
                     self.current_chunk = Cursor::new(data);
                     self.pending_error = error;
                 }
-                None => {
+                Ok(None) => {
                     if let Some(error) = self.input_error.take() {
                         return Err(self.fail(error));
                     }
@@ -1097,6 +1176,91 @@ mod tests {
     }
 
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn is_cancelled(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<DecoderCancelled>())
+    }
+
+    /// A read waiting for a unit that a worker has not finished returns once the flag is
+    /// set, not once the unit is decoded, and so does every read after it. The reader's
+    /// workers are gone once it is dropped.
+    #[test]
+    fn cancellation_ends_a_read_that_waits_for_a_worker() {
+        let (stream, _) = stored_stream(64 * 1024, 3);
+        let hooks = TestHooks {
+            stall_on_unit: Some(0),
+            ..TestHooks::default()
+        };
+        let workers_exited = Arc::clone(&hooks.workers_exited);
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&flag);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = Lzma2ReaderMt::with_options(
+                stream.as_slice(),
+                4096,
+                None,
+                2,
+                u64::MAX,
+                None,
+                hooks,
+            );
+            reader.set_cancellation(cancellation);
+            let mut out = Vec::new();
+            let first = reader.read_to_end(&mut out).unwrap_err();
+            let returned = std::time::Instant::now();
+            let second = reader.read(&mut [0u8; 16]).unwrap_err();
+            let spawned = reader.worker_handles.len();
+            drop(reader);
+            let _ = sender.send((out, first, second, returned, spawned));
+        });
+
+        thread::sleep(Duration::from_millis(200));
+        let requested = std::time::Instant::now();
+        flag.store(true, Ordering::Relaxed);
+        let (out, first, second, returned, spawned) = receiver
+            .recv_timeout(DEADLINE)
+            .expect("the read ignored cancellation");
+        assert!(out.is_empty(), "unit 0 never finished");
+        assert!(is_cancelled(&first), "{first}");
+        assert!(is_cancelled(&second), "{second}");
+        assert!(
+            returned.duration_since(requested) < Duration::from_secs(1),
+            "{:?}",
+            returned.duration_since(requested)
+        );
+        assert_eq!(workers_exited.load(Ordering::Acquire) as usize, spawned);
+    }
+
+    /// A flag set before the first read cancels the stream before anything is read.
+    #[test]
+    fn cancellation_before_the_first_read() {
+        let (stream, _) = stored_stream(64 * 1024, 3);
+        let mut reader = Lzma2ReaderMt::new(stream.as_slice(), 4096, None, 2);
+        reader.set_cancellation(Arc::new(AtomicBool::new(true)));
+        let error = reader.read(&mut [0u8; 16]).unwrap_err();
+        assert!(is_cancelled(&error), "{error}");
+        assert_eq!(reader.next_sequence_to_dispatch, 0);
+    }
+
+    /// Once the rest of the stream decodes on the calling thread, the flag still ends it.
+    #[test]
+    fn cancellation_ends_a_stream_handed_over_to_the_calling_thread() {
+        let (stream, plain) = stored_stream(1024 * 1024, 0);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut reader =
+            Lzma2ReaderMt::with_memory_budget(stream.as_slice(), 4096, None, 2, 512 * 1024);
+        reader.set_cancellation(Arc::clone(&flag));
+        let mut buf = vec![0u8; 4096];
+        let n = reader.read(&mut buf).unwrap();
+        assert!(reader.single.is_some(), "not handed over");
+        assert_eq!(buf[..n], plain[..n]);
+        flag.store(true, Ordering::Relaxed);
+        let error = reader.read(&mut buf).unwrap_err();
+        assert!(is_cancelled(&error), "{error}");
+    }
 
     /// Dropping the reader while a worker decodes a unit does not leave the worker
     /// running: the drop waits for every worker thread to exit.

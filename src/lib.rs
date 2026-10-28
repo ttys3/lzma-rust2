@@ -162,7 +162,7 @@ pub use lzma_reader::{
 };
 pub use lzma2_reader::{Lzma2Reader, Lzma2Stream, get_memory_usage as lzma2_get_memory_usage};
 #[cfg(feature = "std")]
-pub use lzma2_reader_mt::Lzma2ReaderMt;
+pub use lzma2_reader_mt::{DecoderCancelled, Lzma2ReaderMt};
 #[cfg(not(feature = "std"))]
 pub use no_std::Error;
 #[cfg(not(feature = "std"))]
