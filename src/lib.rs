@@ -585,29 +585,53 @@ fn copy_error(error: &Error) -> Error {
 /// It keeps the parts of the error rather than the error itself. A
 /// `std::io::Error` cannot be cloned, and holding one would cost every reader
 /// that holds it the unwind safety the crate guarantees. The kind, the message
-/// and the operating system code carry over, a payload of the source's own does
-/// not.
+/// and the operating system code carry over, and so do the crate's own
+/// cancellation markers, [`DecoderCancelled`] and [`EncoderCancelled`], which
+/// callers tell apart from data errors by type: a BCJ2 stream decoded from a
+/// cancelled [`Lzma2ReaderMt`] reported a plain "decoder cancelled" error. Any
+/// other payload of the source's own does not carry over.
 #[cfg(feature = "std")]
 struct StickyError {
     kind: std::io::ErrorKind,
     message: alloc::string::String,
     os_code: Option<i32>,
+    cancelled: Option<Cancelled>,
+}
+
+/// Which cancellation marker a [`StickyError`] carries.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+enum Cancelled {
+    Decoder,
+    Encoder,
 }
 
 #[cfg(feature = "std")]
 impl StickyError {
     fn new(error: Error) -> Self {
+        let cancelled = error.get_ref().and_then(|inner| {
+            if inner.is::<DecoderCancelled>() {
+                Some(Cancelled::Decoder)
+            } else if inner.is::<EncoderCancelled>() {
+                Some(Cancelled::Encoder)
+            } else {
+                None
+            }
+        });
         Self {
             kind: error.kind(),
             message: error.to_string(),
             os_code: error.raw_os_error(),
+            cancelled,
         }
     }
 
     fn report(&self) -> Error {
-        match self.os_code {
-            Some(code) => Error::from_raw_os_error(code),
-            None => Error::new(self.kind, self.message.clone()),
+        match (self.cancelled, self.os_code) {
+            (Some(Cancelled::Decoder), _) => Error::new(self.kind, DecoderCancelled),
+            (Some(Cancelled::Encoder), _) => Error::new(self.kind, EncoderCancelled),
+            (None, Some(code)) => Error::from_raw_os_error(code),
+            (None, None) => Error::new(self.kind, self.message.clone()),
         }
     }
 }

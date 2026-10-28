@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read and that no budget counted. A worker zeroes its output one chunk ahead of the decoder rather than the whole unit
   before it starts, so one that has just taken a unit stops as soon too (zeroing a 256 MiB unit takes 70 ms on one
   thread, more on several at once).
+- The readers and the writer that report an error again on every later call (`Bcj2Reader`, `LzmaReader`,
+  `LzipReader`, `Bcj2Writer`) keep `DecoderCancelled` and `EncoderCancelled` in that error. They kept only its kind
+  and message, so a BCJ2 stream decoded from a cancelled `Lzma2ReaderMt` reported a plain "decoder cancelled" error
+  that a caller matching the type took for a data error.
 
 ## 0.23.0 - 2026-10-18
 

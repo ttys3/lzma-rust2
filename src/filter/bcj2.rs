@@ -393,6 +393,50 @@ impl<R> Bcj2Reader<R> {
 mod tests {
     use super::*;
 
+    /// A cancelled decoder under a BCJ2 stream is still a cancellation when the BCJ2
+    /// reader reports it, on the read that hit it and on every read after it: callers
+    /// tell it apart from a data error by type.
+    #[test]
+    fn a_cancelled_input_stays_a_cancellation() {
+        struct Cancelled;
+        impl std::io::Read for Cancelled {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(crate::DecoderCancelled))
+            }
+        }
+        let mut reader = Bcj2Reader::new(vec![Cancelled, Cancelled, Cancelled, Cancelled], 1024);
+        for _ in 0..2 {
+            let error = reader.read(&mut [0u8; 64]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<crate::DecoderCancelled>()),
+                "{error}"
+            );
+        }
+    }
+
+    /// Only the cancellation markers carry over as types; any other error keeps its
+    /// kind, message and OS code.
+    #[test]
+    fn a_sticky_error_keeps_the_cancellation_markers() {
+        let encoder = crate::StickyError::new(std::io::Error::other(crate::EncoderCancelled));
+        assert!(
+            encoder
+                .report()
+                .get_ref()
+                .is_some_and(|inner| inner.is::<crate::EncoderCancelled>())
+        );
+        let data =
+            crate::StickyError::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad"))
+                .report();
+        assert_eq!(data.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(data.to_string(), "bad");
+        let os = crate::StickyError::new(std::io::Error::from_raw_os_error(5)).report();
+        assert_eq!(os.raw_os_error(), Some(5));
+    }
+
     #[cfg(feature = "encoder")]
     #[test]
     fn wide_literal_prefix_stops_at_first_marker() {
