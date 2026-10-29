@@ -23,8 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input of the work units gathered and in flight, their output until the caller has read it, and the decoder of each
   unit (its window grows with the unit's output). When the next chunk does not fit, the reader stops reading ahead
   until earlier output has been read. A unit that does not fit on its own, or that grows past the size 7-Zip's
-  encoder gives a unit for the dictionary (`4 * dict_size`, clamped to 1-256 MiB, at least `dict_size`), is decoded on
-  the calling thread with the rest of the stream, after the units before it, as 7-Zip's decoder does.
+  encoder gives a unit for the dictionary (`4 * dict_size`, clamped to 1-256 MiB, at least `dict_size`), is not
+  decoded whole on a worker: it is streamed once the units before it are out (see below), and the units after it
+  decode in parallel again.
+- `Lzma2ReaderMt` streams the unit next in line for the output when no worker has it whole: the first unit of every
+  stream, and any the reader could not read ahead of in time. A worker decodes it chunk by chunk as the reader reads
+  its chunks, up to 16 MiB ahead of the caller (a quarter of the budget, if less), and hands its output back in pieces
+  of up to 2 MiB as soon as they are decoded, while the reader reads on and dispatches the units after it. A stream
+  written as one unit (single-threaded encoders, 7-Zip with `-mmt1`) used to be gathered whole, decoded whole into
+  one buffer on one worker and only then returned; its output is no longer held whole, and its input is read while it
+  is decoded (extracting a 7z block that is one 200 MiB unit: 312 MiB peak RSS before, 116 MiB now, at the same
+  speed; from a source that delivers 20 MB/s and reads nothing ahead, the stream decodes in 2.2 s, as long as reading
+  it takes, against 3.4 s on one thread). Up to the size 7-Zip's encoder gives a unit for the dictionary, the reader reads ahead
+  of the streamed unit as far as the budget allows, to find the units after it; past it, at most 1 MiB ahead.
 - `Lzma2ReaderMt::set_cancellation` takes a shared flag. Once it is set, a read returns an I/O error carrying
   `DecoderCancelled`, and so does every later read; a read that waits for a worker checks the flag every 50 ms, and the
   workers stop at the end of the chunk they are decoding. Without it such a read returns only once the work unit it
