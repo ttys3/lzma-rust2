@@ -1178,6 +1178,9 @@ struct TestHooks {
     /// The reader reads on while the head has output for the caller, until it can read no
     /// further, so that how far it reads ahead does not depend on how fast the test runs.
     read_on: bool,
+    /// The head's worker cannot grow a piece that holds output already, as when the
+    /// allocation fails.
+    refuse_piece_growth: bool,
 }
 
 /// The logic for a single worker thread.
@@ -1461,13 +1464,16 @@ fn stream_unit(unit: StreamedUnit, context: &WorkerContext) -> bool {
                 Err(_) => return false,
             }
         }
-        allowance -= size;
         let start = piece.len();
         if piece.capacity() < start + size {
             // Grow geometrically within `PIECE_MAX`: a piece of many chunks is not copied
             // over and over.
             let target = (start + size).max(2 * piece.capacity()).min(PIECE_MAX);
-            if piece.try_reserve_exact(target - start).is_err() {
+            #[cfg(test)]
+            let refused = context.hooks.refuse_piece_growth && !piece.is_empty();
+            #[cfg(not(test))]
+            let refused = false;
+            if refused || piece.try_reserve_exact(target - start).is_err() {
                 if piece.is_empty() {
                     break Some(io::Error::new(
                         io::ErrorKind::OutOfMemory,
@@ -1475,12 +1481,16 @@ fn stream_unit(unit: StreamedUnit, context: &WorkerContext) -> bool {
                     ));
                 }
                 // What has been decoded goes out; the chunk then starts a piece of its own.
+                // The allowance is charged only once the chunk has room: charging it before,
+                // and again on the next pass, leaked the chunk's size each time, until the
+                // worker waited for credits with nothing left for the caller to take.
                 if !send(core::mem::take(&mut piece)) {
                     return false;
                 }
                 continue;
             }
         }
+        allowance -= size;
         piece.resize(start + size, 0);
         let error = match reader.read_to_chunk_end(&mut piece[start..]) {
             Ok(n) if n == size => continue,
@@ -1941,6 +1951,56 @@ mod tests {
     }
 
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A piece that cannot grow goes out as it is, and the chunk that did not fit starts the
+    /// next one, charged to the allowance once. Charged on every refusal as well, the
+    /// allowance lost a chunk's size each time, down to about two chunks, where pieces go
+    /// out a chunk at a time and nothing is refused any more; a larger chunk after that
+    /// left the head's worker waiting for credits while the caller, with nothing to take,
+    /// waited for it.
+    #[test]
+    fn a_piece_that_cannot_grow_does_not_leak_the_allowance() {
+        // One unit: 4 MiB of 1 KiB chunks, twice the 2 MiB allowance an 8 MiB budget
+        // gives, then 64 KiB chunks.
+        const SMALL: usize = 1024;
+        const LARGE: usize = 64 * 1024;
+        let plain: Vec<u8> = (0..4 * 1024 * 1024 + 32 * LARGE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (small, large) = plain.split_at(4 * 1024 * 1024);
+        let mut stream = Vec::new();
+        let chunks = small.chunks(SMALL).chain(large.chunks(LARGE));
+        for (index, chunk) in chunks.enumerate() {
+            stream.push(if index == 0 { 0x01 } else { 0x02 });
+            stream.extend_from_slice(&u16::try_from(chunk.len() - 1).unwrap().to_be_bytes());
+            stream.extend_from_slice(chunk);
+        }
+        stream.push(0x00);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = Lzma2ReaderMt::with_options(
+                stream.as_slice(),
+                4096,
+                None,
+                2,
+                8 * 1024 * 1024,
+                Some(max_unit_size(4096)),
+                TestHooks {
+                    // The worker has the next chunk in hand when its piece is not empty.
+                    read_on: true,
+                    refuse_piece_growth: true,
+                    ..TestHooks::default()
+                },
+            );
+            let mut out = Vec::new();
+            let result = reader.read_to_end(&mut out).map_err(|e| e.to_string());
+            let _ = sender.send((result, out));
+        });
+
+        let (result, out) = receiver.recv_timeout(DEADLINE).expect("the reader hung");
+        result.unwrap();
+        assert!(out == plain);
+    }
 
     fn is_cancelled(error: &io::Error) -> bool {
         error
