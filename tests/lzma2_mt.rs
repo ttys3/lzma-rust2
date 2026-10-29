@@ -1,10 +1,11 @@
 use std::{
-    io::{Cursor, Read, Write},
+    io::{BufReader, Cursor, Read, Write},
     num::{NonZero, NonZeroU64},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use lzma_rust2::{
@@ -439,8 +440,8 @@ fn read_multi_threaded(
 /// (it used to drop the units read ahead, and the decoded part of the failing one), and
 /// nothing the single-threaded reader would not return.
 ///
-/// Each budget also takes the path where the units from some point on are decoded on the
-/// calling thread: `Some(0)` from the start, the others where a unit does not fit.
+/// Each budget also takes the streamed path: `Some(0)` streams every unit, the others the
+/// unit that does not fit.
 fn assert_matches_single_threaded(
     stream: &[u8],
     dict_size: u32,
@@ -476,7 +477,7 @@ fn assert_matches_single_threaded(
 }
 
 /// Unit sizes in KiB for a stream whose fifth unit does not fit a 1 MiB budget on its
-/// own, so the reader hands over in the middle of it.
+/// own, so the reader streams it once it is next in line.
 const UNEVEN_UNITS_KIB: [usize; 9] = [64, 64, 64, 64, 768, 64, 64, 64, 64];
 const UNEVEN_BUDGETS: [Option<u64>; 3] = [None, Some(0), Some(1024 * 1024)];
 const UNIFORM_BUDGETS: [Option<u64>; 3] = [None, Some(0), Some(2 * 1024 * 1024)];
@@ -628,13 +629,12 @@ fn budgets_never_change_the_output() {
     }
 }
 
-/// The uneven stream exercises what its tests are for: the reader hands over at the unit
-/// that does not fit, not before it.
+/// The uneven stream exercises what its tests are for: the unit that does not fit is
+/// streamed, and the units after it are not.
 #[test]
-fn the_uneven_stream_hands_over_at_its_large_unit() {
+fn the_uneven_stream_streams_its_large_unit() {
     let (stream, dict_size, data) = uneven_stream();
-    let expected = [(None, 9), (Some(0), 0), (Some(1024 * 1024), 4)];
-    for (budget, units_on_workers) in expected {
+    for budget in UNEVEN_BUDGETS {
         for workers in [1, 2, 4] {
             let mut reader = match budget {
                 Some(budget) => Lzma2ReaderMt::with_memory_budget(
@@ -649,11 +649,114 @@ fn the_uneven_stream_hands_over_at_its_large_unit() {
             let mut out = Vec::new();
             reader.read_to_end(&mut out).unwrap();
             assert!(out == data);
-            assert_eq!(
-                reader.chunk_count(),
-                units_on_workers,
-                "{workers} workers, budget {budget:?}"
-            );
+            let what = format!("{workers} workers, budget {budget:?}");
+            assert_eq!(reader.chunk_count(), 9, "{what}");
+            let streamed = reader.chunks_streamed();
+            match budget {
+                // Nothing fits: every unit is streamed in turn.
+                Some(0) => assert_eq!(streamed, 9, "{what}"),
+                // The first unit, the one that does not fit, maybe some the reader could
+                // not read ahead of in time, but not all.
+                Some(_) => assert!((2..9).contains(&streamed), "{what}: {streamed}"),
+                None => assert!((1..9).contains(&streamed), "{what}: {streamed}"),
+            }
         }
     }
+}
+
+/// A source that delivers `rate` bytes a second and reads nothing ahead: every read takes
+/// its length over the rate, as a slow disk or network share without read-ahead.
+/// Read through a buffer, it delivers the stream in bursts, and the caller waits for each.
+struct SlowSource<'a> {
+    data: &'a [u8],
+    pos: usize,
+    rate: f64,
+}
+
+impl Read for SlowSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        std::thread::sleep(Duration::from_secs_f64(n as f64 / self.rate));
+        Ok(n)
+    }
+}
+
+/// A stream written as one unit decodes while a slow source is read, not after it: from a
+/// source as slow as the decoder, one thread takes the time of both, the multi-threaded
+/// reader about the time of either. The head's worker waiting for the caller's reads
+/// brought it close to one thread's time, three times over: an allowance of one piece,
+/// the caller reading after each piece it took, and a result channel with room for one
+/// result. The source delivers 4 MiB at a time, over twice the output a worker may hand
+/// back at once, so a worker held to that stops for every burst. The dictionary keeps the
+/// stream within the unit size 7-Zip writes for it, so the reader reads ahead of the
+/// stream as far as it can.
+///
+/// Timing, so ignored by default:
+/// `cargo test --release --features std,encoder,asm --test lzma2_mt -- --ignored slow_source`
+#[test]
+#[ignore = "timing; run with --release"]
+fn slow_source_one_unit_stream_decodes_while_it_is_read() {
+    let data = std::fs::read(EXECUTABLE).unwrap();
+    let mut options = Lzma2Options::with_preset(1);
+    options.lzma_options.dict_size = 64 << 20;
+    let dict_size = options.lzma_options.dict_size;
+    let mut writer = Lzma2Writer::new(Vec::new(), options);
+    writer.write_all(&data).unwrap();
+    let stream = writer.finish().unwrap();
+
+    let mut reader = Lzma2ReaderMt::new(stream.as_slice(), dict_size, None, 4);
+    std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+    assert_eq!(reader.chunk_count(), 1, "not one unit");
+
+    let decode = |mut reader: Box<dyn Read + '_>| {
+        let mut out = Vec::with_capacity(data.len());
+        reader.read_to_end(&mut out).unwrap();
+        assert!(out == data);
+    };
+    let fastest = |run: &dyn Fn()| {
+        (0..3)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let decoding = fastest(&|| {
+        decode(Box::new(Lzma2Reader::new(
+            stream.as_slice(),
+            dict_size,
+            None,
+        )))
+    });
+    // As long to read as the stream takes to decode.
+    let rate = stream.len() as f64 / decoding.as_secs_f64();
+    let source = || {
+        BufReader::with_capacity(
+            4 << 20,
+            SlowSource {
+                data: &stream,
+                pos: 0,
+                rate,
+            },
+        )
+    };
+    let single = fastest(&|| decode(Box::new(Lzma2Reader::new(source(), dict_size, None))));
+    let multi = fastest(&|| {
+        decode(Box::new(Lzma2ReaderMt::with_memory_budget(
+            source(),
+            dict_size,
+            None,
+            4,
+            1 << 30,
+        )))
+    });
+    println!("decoding {decoding:?}, one thread {single:?}, multi-threaded {multi:?}");
+    assert!(
+        multi.as_secs_f64() < 0.8 * single.as_secs_f64(),
+        "multi-threaded {multi:?} against {single:?} on one thread, decoding {decoding:?}"
+    );
 }

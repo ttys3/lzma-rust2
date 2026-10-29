@@ -82,6 +82,14 @@ const MIB: usize = 1024 * KIB;
 /// queue and the map of results waiting for their turn.
 const SLACK: usize = 64 * KIB;
 
+/// The largest compressed chunk with its header: the streamed unit's worker is sent the
+/// chunk it decodes next whatever the budget, as the single-threaded reader reads it.
+const CHUNK_MAX: usize = 64 * KIB + 6;
+
+/// The largest piece of output, a chunk's at most: the streamed unit's worker decodes one
+/// while the caller reads the one before it.
+const CHUNK_UNPACKED_MAX: usize = 2 * MIB;
+
 /// Text and pseudo-random bytes in turn, 16 KiB each.
 fn mixed_data(len: usize) -> Vec<u8> {
     let text = std::fs::read("tests/data/pg100.txt").unwrap();
@@ -135,8 +143,10 @@ fn check_output(mut reader: impl Read, expected: &[u8], buf: &mut [u8]) {
 struct Measured {
     /// Peak with the budget.
     peak: usize,
-    /// Units decoded on the workers.
-    units_on_workers: u64,
+    /// Work units in the stream.
+    units: u64,
+    /// Those streamed, the first one among them.
+    units_streamed: u64,
     /// Peak of the single-threaded reader on the same stream.
     single_peak: usize,
     /// Peak of the reader without a budget.
@@ -145,10 +155,10 @@ struct Measured {
 
 fn measure(stream: &[u8], dict_size: u32, expected: &[u8], budget: u64) -> Measured {
     let mut buf = vec![0u8; 64 * KIB];
-    let (peak, units_on_workers) = heap_peak(|| {
+    let (peak, (units, units_streamed)) = heap_peak(|| {
         let mut reader = Lzma2ReaderMt::with_memory_budget(stream, dict_size, None, 4, budget);
         check_output(&mut reader, expected, &mut buf);
-        reader.chunk_count()
+        (reader.chunk_count(), reader.chunks_streamed())
     });
     let (single_peak, ()) = heap_peak(|| {
         let reader = Lzma2Reader::new(stream, dict_size, None);
@@ -160,18 +170,19 @@ fn measure(stream: &[u8], dict_size: u32, expected: &[u8], budget: u64) -> Measu
     });
     println!(
         "budget {budget}: peak {peak}, single-threaded {single_peak}, unbounded {unbounded_peak}, \
-         {units_on_workers} units on the workers"
+         {units} units, {units_streamed} streamed"
     );
     Measured {
         peak,
-        units_on_workers,
+        units,
+        units_streamed,
         single_peak,
         unbounded_peak,
     }
 }
 
-/// Streams whose units all fit the budget: every unit is decoded on a worker, the reader
-/// stays within the budget, and without one it would not have.
+/// Streams whose units all fit the budget: units after the first are decoded on the
+/// workers, the reader stays within the budget, and without one it would not have.
 #[test]
 fn units_that_fit_stay_within_the_budget() {
     let _turn = ONE_AT_A_TIME.lock().unwrap();
@@ -206,10 +217,10 @@ fn units_that_fit_stay_within_the_budget() {
         let data = mixed_data(case.sizes.iter().sum());
         let stream = units_stream(&data, &case.sizes, case.dict_size);
         let measured = measure(&stream, case.dict_size, &data, case.budget);
-        assert_eq!(
-            measured.units_on_workers,
-            case.sizes.len() as u64,
-            "{}",
+        assert_eq!(measured.units, case.sizes.len() as u64, "{}", case.name);
+        assert!(
+            measured.units_streamed < measured.units,
+            "{}: nothing on the workers",
             case.name
         );
         assert!(
@@ -244,7 +255,8 @@ fn many_tiny_units_stay_within_the_budget() {
     stream.push(0x00);
     let budget = MIB as u64;
     let measured = measure(&stream, 64 * MIB as u32, &data, budget);
-    assert_eq!(measured.units_on_workers, 2000);
+    assert_eq!(measured.units, 2000);
+    assert!(measured.units_streamed < 2000);
     assert!(
         measured.peak <= budget as usize + SLACK,
         "peak {} over the budget {budget}",
@@ -252,8 +264,9 @@ fn many_tiny_units_stay_within_the_budget() {
     );
 }
 
-/// A unit that does not fit the budget on its own goes to the calling thread, after the
-/// units before it: the peak is the budget or what the single-threaded reader needs,
+/// A unit that does not fit the budget on its own is streamed, after the units before it,
+/// and the units after it go to the workers again: the peak is the budget or what the
+/// single-threaded reader needs with a chunk of input and two of output in transit,
 /// whichever is larger.
 #[test]
 fn a_unit_over_the_budget_costs_what_single_threaded_does() {
@@ -265,8 +278,14 @@ fn a_unit_over_the_budget_costs_what_single_threaded_does() {
     let stream = units_stream(&data, &sizes, dict_size);
     let budget = 2 * MIB as u64;
     let measured = measure(&stream, dict_size, &data, budget);
-    assert_eq!(measured.units_on_workers, 4);
-    let bound = (budget as usize).max(measured.single_peak) + SLACK;
+    assert_eq!(measured.units, 9);
+    assert!(
+        (2..9).contains(&measured.units_streamed),
+        "{} streamed",
+        measured.units_streamed
+    );
+    let in_transit = CHUNK_MAX + 2 * CHUNK_UNPACKED_MAX;
+    let bound = (budget as usize).max(measured.single_peak + in_transit) + SLACK;
     assert!(
         measured.peak <= bound,
         "peak {} over {bound} (single-threaded {})",
